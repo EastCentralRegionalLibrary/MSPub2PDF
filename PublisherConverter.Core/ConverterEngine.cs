@@ -13,7 +13,7 @@ namespace PublisherConverter.Core
         {
             var tcs = new TaskCompletionSource();
 
-            // The orchestrator thread manages the file batch queue, completely decoupled from COM properties
+            // The orchestrator thread manages the file batch queue, completely decoupled from COM handles
             var orchestratorThread = new Thread(() =>
             {
                 var report = new ProgressReport();
@@ -21,6 +21,7 @@ namespace PublisherConverter.Core
                 var indexedFiles = new List<FileRecord>();
                 ArchiveService? archiveService = null;
 
+                // Instantiate the lifecycle manager with a 3-strike consecutive file crash rule
                 var lifecycleManager = new PublisherLifecycleManager(maxConsecutiveFailures: 3);
 
                 if (!string.IsNullOrEmpty(options.ArchivePath))
@@ -40,7 +41,7 @@ namespace PublisherConverter.Core
                 try
                 {
                     // Phase 1: Discovery & Indexing
-                    progress.Report(new ProgressReport { CurrentActionMessage = "Scanning source folder for active Publisher files..." });
+                    progress.Report(UpdateProgressState(report, "Scanning source folder for active Publisher files...", null));
                     if (!Directory.Exists(options.SourcePath)) throw new DirectoryNotFoundException("Source path selection is invalid.");
 
                     var files = Directory.GetFiles(options.SourcePath, "*.pub", SearchOption.AllDirectories);
@@ -48,7 +49,7 @@ namespace PublisherConverter.Core
 
                     if (report.TotalFiles == 0)
                     {
-                        progress.Report(new ProgressReport { CurrentActionMessage = "Run complete. Zero .pub targets discovered." });
+                        progress.Report(UpdateProgressState(report, "Run complete. Zero .pub targets discovered.", null));
                         tcs.SetResult();
                         return;
                     }
@@ -74,7 +75,7 @@ namespace PublisherConverter.Core
                         });
                     }
 
-                    // Bootstrap the sandboxed background threading containers
+                    // Bootstrap the isolated background worker apartment container
                     lifecycleManager.InitializeEngine();
 
                     // Phase 2: Processing Loop
@@ -85,7 +86,7 @@ namespace PublisherConverter.Core
                             throw new OperationCanceledException(cancellationToken);
                         }
 
-                        // Step A: Static Triage
+                        // Step A: Static Triage (Inspect without mounting the COM engine)
                         var safety = PublisherInspector.InspectFile(record.OriginalFullPath);
                         if (safety.IsPasswordProtected || safety.IsCorruptedOrInvalid)
                         {
@@ -99,7 +100,7 @@ namespace PublisherConverter.Core
                         }
                         record.SourceHash = GetSha256Hash(record.OriginalFullPath);
 
-                        // Step B: Ingress Staging
+                        // Step B: Ingress Staging (Local Copying)
                         try
                         {
                             string localDir = Path.GetDirectoryName(record.LocalPubPath)!;
@@ -124,17 +125,19 @@ namespace PublisherConverter.Core
                         // Intra-File Local Retry Loop
                         for (int attempt = 1; attempt <= maxFileAttempts; attempt++)
                         {
+                            if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken);
+
                             string attemptPrefix = attempt > 1 ? $"[Retry {attempt}/{maxFileAttempts}] " : "";
                             progress.Report(UpdateProgressState(report, $"{attemptPrefix}Processing: {record.FileName}", record));
 
                             try
                             {
-                                // Hand the local scratch paths directly down to the sandboxed lifecycle manager
+                                // Dispatch the file variables down to the isolated worker apartment
                                 lifecycleManager.ExecuteRenderingJob(record, record.LocalPubPath, record.LocalPdfPath, options.RunLinkCheck, options.FileTimeoutSeconds, cancellationToken);
 
                                 renderingSucceeded = true;
                                 record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
-                                break; // Success! Break out of local file attempts loop
+                                break; // Rendering succeeded; break out of the local retry attempts loop
                             }
                             catch (OperationCanceledException)
                             {
@@ -142,12 +145,20 @@ namespace PublisherConverter.Core
                             }
                             catch (Exception ex)
                             {
+                                // REFACTOR: Intercept the sequential circuit breaker exception.
+                                // Rethrow instantly to escape the retry loop and queue to trigger an orderly cleanup.
+                                if (ex.Message.Contains("circuit breaker tripped"))
+                                {
+                                    throw;
+                                }
+
                                 if (attempt < maxFileAttempts)
                                 {
                                     record.Details = $"Attempt {attempt} thrown out ({ex.GetType().Name}). Accessing local retry block...";
                                     continue;
                                 }
 
+                                // All local retry options exhausted for this file
                                 record.Status = MigrationStatus.FailedConversion;
                                 record.Details = ex is TimeoutException
                                     ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
@@ -155,7 +166,7 @@ namespace PublisherConverter.Core
                             }
                         }
 
-                        // Step C: Egress & Metadata Output Cloning
+                        // Step C: Egress & Metadata Cloning
                         if (renderingSucceeded)
                         {
                             try
@@ -190,6 +201,7 @@ namespace PublisherConverter.Core
                             }
                         }
 
+                        // Update metrics tracking
                         if (record.Status == MigrationStatus.VerifiedComplete) report.SuccessCount++;
                         else if (record.Status == MigrationStatus.VerifiedWithWarnings) report.WarningCount++;
                         else report.FailureCount++;
@@ -229,6 +241,7 @@ namespace PublisherConverter.Core
                 }
                 finally
                 {
+                    // Gracefully shutdown the engine and clear local workspace structures
                     lifecycleManager.ShutdownEngine();
                     if (Directory.Exists(scratchRoot))
                     {
