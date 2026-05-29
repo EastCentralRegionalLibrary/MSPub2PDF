@@ -1,31 +1,28 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Office.Interop.Publisher;
 
 namespace PublisherConverter.Core
 {
     public class ConverterEngine
     {
-        private Application? _pubApp;
-        private int _loopCounter = 0;
-        private readonly object _comLock = new object();
-
-        public async Task ExecuteMigrationAsync(ConversionOptions options, IProgress<ProgressReport> progress, CancellationToken cancellationToken)
+        public Task ExecuteMigrationAsync(ConversionOptions options, IProgress<ProgressReport> progress, CancellationToken cancellationToken)
         {
-            // FIX 1: Explicitly offload the execution loop to a background ThreadPool thread
-            // This ensures the WPF UI remains highly responsive, smooth, and cancellable.
-            await Task.Run(() =>
+            var tcs = new TaskCompletionSource();
+
+            // The orchestrator thread manages the file batch queue, completely decoupled from COM properties
+            var orchestratorThread = new Thread(() =>
             {
                 var report = new ProgressReport();
                 string scratchRoot = Path.Combine(Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\", "_pubscratch");
                 var indexedFiles = new List<FileRecord>();
-
                 ArchiveService? archiveService = null;
+
+                var lifecycleManager = new PublisherLifecycleManager(maxConsecutiveFailures: 3);
+
                 if (!string.IsNullOrEmpty(options.ArchivePath))
                 {
                     try
@@ -35,7 +32,8 @@ namespace PublisherConverter.Core
                     }
                     catch (Exception ex)
                     {
-                        throw new InvalidOperationException($"Failed to initialize backup directory structure: {ex.Message}", ex);
+                        tcs.SetException(new InvalidOperationException($"Failed to initialize backup directory structure: {ex.Message}", ex));
+                        return;
                     }
                 }
 
@@ -51,14 +49,17 @@ namespace PublisherConverter.Core
                     if (report.TotalFiles == 0)
                     {
                         progress.Report(new ProgressReport { CurrentActionMessage = "Run complete. Zero .pub targets discovered." });
+                        tcs.SetResult();
                         return;
                     }
 
                     foreach (var file in files)
                     {
-                        var info = new FileInfo(file);
-                        string relative = Path.GetDirectoryName(file)?[options.SourcePath.Length..] ?? "";
+                        string relativePathFile = Path.GetRelativePath(options.SourcePath, file);
+                        string relative = Path.GetDirectoryName(relativePathFile) ?? "";
+                        if (relative == ".") relative = "";
 
+                        var info = new FileInfo(file);
                         indexedFiles.Add(new FileRecord
                         {
                             FileName = info.Name,
@@ -73,17 +74,16 @@ namespace PublisherConverter.Core
                         });
                     }
 
-                    // Phase 2: Start Headless Engine
-                    InitializePublisherEngine();
+                    // Bootstrap the sandboxed background threading containers
+                    lifecycleManager.InitializeEngine();
 
-                    // Phase 3: Processing Loop
+                    // Phase 2: Processing Loop
                     foreach (var record in indexedFiles)
                     {
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        report.CurrentFile = record;
-                        report.CurrentActionMessage = $"Processing: {record.FileName}";
-                        progress.Report(report);
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            throw new OperationCanceledException(cancellationToken);
+                        }
 
                         // Step A: Static Triage
                         var safety = PublisherInspector.InspectFile(record.OriginalFullPath);
@@ -91,13 +91,15 @@ namespace PublisherConverter.Core
                         {
                             record.Status = MigrationStatus.FailedConversion;
                             record.Details = safety.Reason;
+
                             report.FailureCount++;
                             report.ProcessedFiles++;
+                            progress.Report(UpdateProgressState(report, $"Skipped static triage: {record.FileName}", record));
                             continue;
                         }
                         record.SourceHash = GetSha256Hash(record.OriginalFullPath);
 
-                        // Step B: Ingress (Local Staging)
+                        // Step B: Ingress Staging
                         try
                         {
                             string localDir = Path.GetDirectoryName(record.LocalPubPath)!;
@@ -109,103 +111,52 @@ namespace PublisherConverter.Core
                         {
                             record.Status = MigrationStatus.FailedIngress;
                             record.Details = $"Ingress Lock/IO Exception: {ex.Message}";
+
                             report.FailureCount++;
                             report.ProcessedFiles++;
+                            progress.Report(UpdateProgressState(report, $"Ingress Failure: {record.FileName}", record));
                             continue;
                         }
 
-                        // Step C: Link Audit & Conversion Rendering
-                        Document? doc = null;
-                        bool processingTimedOut = false;
+                        const int maxFileAttempts = 3;
+                        bool renderingSucceeded = false;
 
-                        // FIX 3: Link the administrative UI cancellation token straight to the Watchdog monitor.
-                        // If a user clicks 'Abort', the watchdog trips immediately to kill mspub.exe and unblock the engine.
-                        using (var timeoutCts = new CancellationTokenSource())
-                        using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token))
+                        // Intra-File Local Retry Loop
+                        for (int attempt = 1; attempt <= maxFileAttempts; attempt++)
                         {
-                            var watchdogTask = Task.Delay(TimeSpan.FromSeconds(options.FileTimeoutSeconds), linkedCts.Token)
-                                .ContinueWith(t =>
-                                {
-                                    if (cancellationToken.IsCancellationRequested)
-                                    {
-                                        KillPublisherProcesses();
-                                    }
-                                    else if (!t.IsCanceled)
-                                    {
-                                        processingTimedOut = true;
-                                        KillPublisherProcesses();
-                                    }
-                                });
+                            string attemptPrefix = attempt > 1 ? $"[Retry {attempt}/{maxFileAttempts}] " : "";
+                            progress.Report(UpdateProgressState(report, $"{attemptPrefix}Processing: {record.FileName}", record));
+
                             try
                             {
-                                lock (_comLock)
-                                {
-                                    // If a previous crash left the engine dead, resurrect it safely before continuing
-                                    if (_pubApp == null) InitializePublisherEngine();
+                                // Hand the local scratch paths directly down to the sandboxed lifecycle manager
+                                lifecycleManager.ExecuteRenderingJob(record, record.LocalPubPath, record.LocalPdfPath, options.RunLinkCheck, options.FileTimeoutSeconds, cancellationToken);
 
-                                    doc = _pubApp!.Open(Filename: record.LocalPubPath, ReadOnly: true);
-
-                                    if (options.RunLinkCheck)
-                                    {
-                                        AuditDocumentLinks(doc, record);
-                                    }
-
-                                    doc.ExportAsFixedFormat(
-                                        Format: PbFixedFormatType.pbFixedFormatTypePDF,
-                                        Filename: record.LocalPdfPath,
-                                        Intent: PbFixedFormatIntent.pbIntentCommercial,
-                                        IncludeDocumentProperties: true,
-                                        DocStructureTags: true,
-                                        BitmapMissingFonts: true,
-                                        UseISO19005_1: true
-                                    );
-                                }
-
-                                timeoutCts.Cancel(); // File completed cleanly; shut down the timer
+                                renderingSucceeded = true;
                                 record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
+                                break; // Success! Break out of local file attempts loop
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                throw;
                             }
                             catch (Exception ex)
                             {
-                                timeoutCts.Cancel();
-
-                                if (cancellationToken.IsCancellationRequested)
+                                if (attempt < maxFileAttempts)
                                 {
-                                    throw new OperationCanceledException(cancellationToken);
+                                    record.Details = $"Attempt {attempt} thrown out ({ex.GetType().Name}). Accessing local retry block...";
+                                    continue;
                                 }
 
-                                if (processingTimedOut)
-                                {
-                                    record.Status = MigrationStatus.FailedConversion;
-                                    record.Details = $"Execution Timeout: Exceeded limits of {options.FileTimeoutSeconds}s. Process terminated.";
-                                    _pubApp = null;
-                                }
-                                else
-                                {
-                                    record.Status = MigrationStatus.FailedConversion;
-                                    record.Details = $"COM Rendering Exception: {ex.Message.Trim()}";
-                                }
-                            }
-                            finally
-                            {
-                                lock (_comLock)
-                                {
-                                    // FIX 2: Wrapped in a robust catch wrapper to handle dead COM pointers safely
-                                    if (doc != null)
-                                    {
-                                        try
-                                        {
-                                            doc.Close();
-                                            System.Runtime.InteropServices.Marshal.ReleaseComObject(doc);
-                                        }
-                                        catch { /* Swallow expected RPC errors from forced process terminations */ }
-                                        doc = null;
-                                    }
-                                }
+                                record.Status = MigrationStatus.FailedConversion;
+                                record.Details = ex is TimeoutException
+                                    ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
+                                    : $"COM Rendering Exception: {ex.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
                             }
                         }
 
-                        // Step D: Egress & Metadata Cloning
-                        if (record.Status == MigrationStatus.VerifiedComplete || record.Status == MigrationStatus.VerifiedWithWarnings)
+                        // Step C: Egress & Metadata Output Cloning
+                        if (renderingSucceeded)
                         {
                             try
                             {
@@ -224,49 +175,38 @@ namespace PublisherConverter.Core
                                         ? $"Archived cleanly but missing {record.MissingAssetsCount} external dependencies."
                                         : "Converted cleanly to PDF/A.";
 
-                                    // FIX 4: Re-route Archive Staging here so we only back up verified successful documents
                                     archiveService?.StageFile(record.OriginalFullPath, record.RelativePath, record.FileName);
-
-                                    if (record.MissingAssetsCount > 0) report.WarningCount++; else report.SuccessCount++;
                                 }
                                 else
                                 {
                                     record.Status = MigrationStatus.FailedEgress;
                                     record.Details = "PDF generation completed but scratch file was missing.";
-                                    report.FailureCount++;
                                 }
                             }
                             catch (Exception ex)
                             {
                                 record.Status = MigrationStatus.FailedEgress;
                                 record.Details = $"Egress Save Failure: {ex.Message}";
-                                report.FailureCount++;
                             }
                         }
-                        else
-                        {
-                            report.FailureCount++;
-                        }
 
-                        // Step E: Housekeeping & Process Recycling Check
+                        if (record.Status == MigrationStatus.VerifiedComplete) report.SuccessCount++;
+                        else if (record.Status == MigrationStatus.VerifiedWithWarnings) report.WarningCount++;
+                        else report.FailureCount++;
+
                         report.ProcessedFiles++;
-                        _loopCounter++;
-                        if (_loopCounter >= options.ProcessRecycleInterval && _pubApp != null)
-                        {
-                            RecyclePublisherProcess(progress);
-                        }
+                        progress.Report(UpdateProgressState(report, $"Finished: {record.FileName}", record));
                     }
 
                     if (archiveService != null)
                     {
-                        progress.Report(new ProgressReport { CurrentActionMessage = "Compressing historical archive repository to ZIP container..." });
+                        progress.Report(UpdateProgressState(report, "Compressing historical archive repository to ZIP container...", null));
                         archiveService.FinalizeArchive();
                     }
 
-                    // Phase 4: Optional Purges
                     if (options.DeleteSourceOnSuccess)
                     {
-                        progress.Report(new ProgressReport { CurrentActionMessage = "Cleaning up source network footprints..." });
+                        progress.Report(UpdateProgressState(report, "Cleaning up source network footprints...", null));
                         foreach (var record in indexedFiles)
                         {
                             if ((record.Status == MigrationStatus.VerifiedComplete || record.Status == MigrationStatus.VerifiedWithWarnings) && File.Exists(record.FinalPdfPath))
@@ -277,104 +217,50 @@ namespace PublisherConverter.Core
                     }
 
                     ExportAuditTrailCsv(options.SourcePath, indexedFiles);
+                    tcs.SetResult();
+                }
+                catch (OperationCanceledException ex)
+                {
+                    tcs.SetCanceled(ex.CancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
                 }
                 finally
                 {
-                    ShutdownPublisherEngine();
+                    lifecycleManager.ShutdownEngine();
                     if (Directory.Exists(scratchRoot))
                     {
                         try { Directory.Delete(scratchRoot, true); } catch { }
                     }
                 }
-            }, cancellationToken);
+            });
+
+            orchestratorThread.IsBackground = true;
+            orchestratorThread.Start();
+
+            return tcs.Task;
         }
 
-        private void InitializePublisherEngine()
+        private ProgressReport UpdateProgressState(ProgressReport masterReport, string actionMessage, FileRecord? currentFile)
         {
-            lock (_comLock)
+            return new ProgressReport
             {
-                _pubApp = new Application();
-                _pubApp.AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityForceDisable;
-                _loopCounter = 0;
-            }
-        }
-
-        private void RecyclePublisherProcess(IProgress<ProgressReport> progress)
-        {
-            progress.Report(new ProgressReport { CurrentActionMessage = "Recycling underlying Office automation framework..." });
-            ShutdownPublisherEngine();
-            InitializePublisherEngine();
-        }
-
-        private void ShutdownPublisherEngine()
-        {
-            lock (_comLock)
-            {
-                if (_pubApp != null)
-                {
-                    try { _pubApp.Quit(); } catch { }
-                    try { System.Runtime.InteropServices.Marshal.ReleaseComObject(_pubApp); } catch { }
-                    _pubApp = null;
-                }
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-            }
-        }
-
-        private void KillPublisherProcesses()
-        {
-            foreach (var process in Process.GetProcessesByName("mspub"))
-            {
-                try
-                {
-                    process.Kill();
-                    process.WaitForExit(5000);
-                }
-                catch { }
-            }
-        }
-
-        private void AuditDocumentLinks(Document doc, FileRecord record)
-        {
-            var brokenAssets = new List<string>();
-
-            foreach (Page page in doc.Pages)
-            {
-                foreach (Shape shape in page.Shapes)
-                {
-                    try
-                    {
-                        if (shape.PictureFormat != null && shape.PictureFormat.IsLinked == Microsoft.Office.Core.MsoTriState.msoTrue)
-                        {
-                            string fileRef = shape.PictureFormat.Filename;
-                            if (!File.Exists(fileRef)) brokenAssets.Add($"[Page {page.PageNumber}] Image Link: {fileRef}");
-                        }
-                    }
-                    catch { }
-
-                    try
-                    {
-                        if (shape.LinkFormat != null && !string.IsNullOrEmpty(shape.LinkFormat.SourceFullName))
-                        {
-                            string OleRef = shape.LinkFormat.SourceFullName;
-                            if (!File.Exists(OleRef)) brokenAssets.Add($"[Page {page.PageNumber}] OLE Data Ref: {OleRef}");
-                        }
-                    }
-                    catch { }
-                }
-            }
-
-            if (brokenAssets.Count > 0)
-            {
-                record.MissingAssetsCount = brokenAssets.Count;
-                record.MissingAssetsList = string.Join(" | ", brokenAssets);
-            }
+                TotalFiles = masterReport.TotalFiles,
+                ProcessedFiles = masterReport.ProcessedFiles,
+                SuccessCount = masterReport.SuccessCount,
+                WarningCount = masterReport.WarningCount,
+                FailureCount = masterReport.FailureCount,
+                CurrentActionMessage = actionMessage,
+                CurrentFile = currentFile
+            };
         }
 
         public static string GetSha256Hash(string filePath)
         {
             if (!File.Exists(filePath)) return "Missing";
-            using var sha = SHA256.Create();
+            using var sha = System.Security.Cryptography.SHA256.Create();
             using var stream = File.OpenRead(filePath);
             return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
         }
