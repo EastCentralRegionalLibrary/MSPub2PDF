@@ -43,7 +43,6 @@ namespace PublisherConverter.Core
             lock (_stateLock)
             {
                 VerifyEngineAvailability();
-                _isWorkerTerminated = false;
                 _workerThread = StartNewActiveWorkerApartment();
             }
         }
@@ -115,13 +114,17 @@ namespace PublisherConverter.Core
                     throw _workerException;
                 }
 
-                // Operation successfully completed: Clear global sequential fault metrics
+                // Any successful rendering clears the machine-level circuit breaker counter
                 _consecutiveFailureCount = 0;
             }
         }
 
         private Thread StartNewActiveWorkerApartment()
         {
+            // FIX: Explicitly clear the termination flag context state before kicking off the new thread.
+            // This prevents the replacement thread from reading a stale 'true' flag and exiting immediately at boot.
+            _isWorkerTerminated = false;
+
             var thread = new Thread(DedicatedWorkerApartmentLoop);
             thread.SetApartmentState(ApartmentState.STA);
             thread.IsBackground = true;
