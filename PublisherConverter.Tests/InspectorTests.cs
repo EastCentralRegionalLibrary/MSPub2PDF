@@ -138,7 +138,7 @@ namespace PublisherConverter.Tests
             string dynamicStagingPath = stagingDirsBefore[0];
 
             // Act - Part B: Stage an asset deep inside a relative subfolder path layout
-            string nestedRelativePath = Path.Combine("Marketing", "Newsletters", "SummerPass");;
+            string nestedRelativePath = Path.Combine("Marketing", "Newsletters", "SummerPass");
             archiveSvc.StageFile(sourceFileFake, nestedRelativePath, "summer_draft.pub");
 
             // Assert - Part B: Verify directory structure replication
