@@ -290,7 +290,7 @@ namespace PublisherConverter.Core
             }
         }
 
-        private string GetSha256Hash(string filePath)
+        public static string GetSha256Hash(string filePath)
         {
             if (!File.Exists(filePath)) return "Missing";
             using var sha = SHA256.Create();

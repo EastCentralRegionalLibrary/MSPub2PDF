@@ -5,8 +5,182 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:PublisherConverter.GUI"
         mc:Ignorable="d"
-        Title="MainWindow" Height="450" Width="800">
-    <Grid>
+        Title="Microsoft Publisher Bulk Migration Utility"
+        Height="650"
+        Width="800"
+        WindowStartupLocation="CenterScreen"
+        Background="#F5F5F7">
 
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <GroupBox Header="Migration Execution Paths"
+                  Grid.Row="0"
+                  Margin="0,0,0,15"
+                  Padding="10"
+                  FontWeight="SemiBold">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="130"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="80"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="10"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <TextBlock Text="Source Folder:"
+                           VerticalAlignment="Center"
+                           Grid.Row="0"
+                           Grid.Column="0"
+                           FontWeight="Normal"/>
+                <TextBox x:Name="TxtSourcePath"
+                         Grid.Row="0"
+                         Grid.Column="1"
+                         VerticalContentAlignment="Center"
+                         Height="26"
+                         Margin="0,0,10,0"
+                         FontWeight="Normal"/>
+                <Button x:Name="BtnBrowseSource"
+                        Content="Browse..."
+                        Grid.Row="0"
+                        Grid.Column="2"
+                        Height="26"
+                        Click="BtnBrowseSource_Click"
+                        FontWeight="Normal"/>
+
+                <TextBlock Text="Backup Destination:"
+                           VerticalAlignment="Center"
+                           Grid.Row="2"
+                           Grid.Column="0"
+                           FontWeight="Normal"/>
+                <TextBox x:Name="TxtArchivePath"
+                         Grid.Row="2"
+                         Grid.Column="1"
+                         VerticalContentAlignment="Center"
+                         Height="26"
+                         Margin="0,0,10,0"
+                         FontWeight="Normal"/>
+                <Button x:Name="BtnBrowseArchive"
+                        Content="Browse..."
+                        Grid.Row="2"
+                        Grid.Column="2"
+                        Height="26"
+                        Click="BtnBrowseArchive_Click"
+                        FontWeight="Normal"/>
+            </Grid>
+        </GroupBox>
+
+        <GroupBox Header="Processing Rules &amp; Safe Rails"
+                  Grid.Row="1"
+                  Margin="0,0,0,15"
+                  Padding="10"
+                  FontWeight="SemiBold">
+            <WrapPanel Orientation="Horizontal">
+                <CheckBox x:Name="ChkRunLinkCheck"
+                          Content="Audit linked assets (Images/OLE)"
+                          IsChecked="True"
+                          Margin="0,0,25,0"
+                          VerticalAlignment="Center"
+                          FontWeight="Normal"/>
+                <CheckBox x:Name="ChkDeleteSource"
+                          Content="Purge original .pub targets on verified success"
+                          IsChecked="False"
+                          Margin="0,0,25,0"
+                          VerticalAlignment="Center"
+                          FontWeight="Normal"
+                          Foreground="#D32F2F"/>
+                <StackPanel Orientation="Horizontal"
+                            VerticalAlignment="Center">
+                    <TextBlock Text="Recycle Engine Every:"
+                               VerticalAlignment="Center"
+                               FontWeight="Normal"/>
+                    <TextBox x:Name="TxtRecycleInterval"
+                             Text="50"
+                             Width="40"
+                             Height="22"
+                             Margin="5,0,5,0"
+                             HorizontalContentAlignment="Center"
+                             VerticalContentAlignment="Center"
+                             FontWeight="Normal"/>
+                    <TextBlock Text="files"
+                               VerticalAlignment="Center"
+                               FontWeight="Normal"/>
+                </StackPanel>
+            </WrapPanel>
+        </GroupBox>
+
+        <Grid Grid.Row="2"
+              Margin="0,0,0,15">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="150"/>
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal"
+                        Grid.Column="0">
+                <Button x:Name="BtnStart"
+                        Content="Start Migration Pass"
+                        Width="160"
+                        Height="32"
+                        Background="#1B5E20"
+                        Foreground="White"
+                        FontWeight="Bold"
+                        Click="BtnStart_Click"/>
+                <Button x:Name="BtnCancel"
+                        Content="Abort Run"
+                        Width="110"
+                        Height="32"
+                        Margin="10,0,0,0"
+                        Background="#B71C1C"
+                        Foreground="White"
+                        FontWeight="Bold"
+                        IsEnabled="False"
+                        Click="BtnCancel_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <StackPanel Grid.Row="3"
+                    Margin="0,0,0,15">
+            <Grid Margin="0,0,0,5">
+                <TextBlock x:Name="LblStatusMessage"
+                           Text="System Idle. Awaiting execution paths..."
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="LblProgressCounts"
+                           Text="0 / 0 files (0%)"
+                           HorizontalAlignment="Right"
+                           VerticalAlignment="Center"/>
+            </Grid>
+            <ProgressBar x:Name="ProgressIndicator"
+                         Height="18"
+                         Minimum="0"
+                         Maximum="100"
+                         Value="0"
+                         Foreground="#1B5E20"/>
+        </StackPanel>
+
+        <GroupBox Header="Live Console Log Diagnostics Output"
+                  Grid.Row="4"
+                  Padding="5"
+                  FontWeight="SemiBold">
+            <TextBox x:Name="TxtConsoleLog"
+                     IsReadOnly="True"
+                     TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     Background="#1E1E1E"
+                     Foreground="#D4D4D4"
+                     FontFamily="Consolas"
+                     FontSize="12"
+                     FontWeight="Normal"/>
+        </GroupBox>
     </Grid>
 </Window>

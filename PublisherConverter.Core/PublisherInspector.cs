@@ -50,11 +50,6 @@ namespace PublisherConverter.Core
                     }
                 }
             }
-            catch (CFCorruptedFileException)
-            {
-                status.IsCorruptedOrInvalid = true;
-                status.Reason = "Invalid file layout (Not a standard .pub binary container or corrupt).";
-            }
             catch (CFException ex) when (ex.Message.Contains
             ("encrypted", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains
             ("password", StringComparison.OrdinalIgnoreCase))
@@ -62,6 +57,11 @@ namespace PublisherConverter.Core
                 // OpenMcdf throws an internal file exception if structural sectors are locked by encryption
                 status.IsPasswordProtected = true;
                 status.Reason = "File is password protected or encrypted.";
+            }
+            catch (CFException)
+            {
+                status.IsCorruptedOrInvalid = true;
+                status.Reason = "Invalid file layout (Not a standard .pub binary container or corrupt).";
             }
             catch (Exception ex)
             {
