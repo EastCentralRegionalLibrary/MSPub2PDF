@@ -67,8 +67,8 @@ namespace PublisherConverter.Core
                             CreationTime = info.CreationTime,
                             LastWriteTime = info.LastWriteTime,
                             SourceSizeLength = info.Length,
-                            LocalPubPath = Path.Combine(scratchRoot, relative.TrimStart('\\'), info.Name),
-                            LocalPdfPath = Path.Combine(scratchRoot, relative.TrimStart('\\'), Path.ChangeExtension(info.Name, ".pdf")),
+                            LocalPubPath = Path.Combine(scratchRoot, relative.TrimStart('\\', '/'), info.Name),
+                            LocalPdfPath = Path.Combine(scratchRoot, relative.TrimStart('\\', '/'), Path.ChangeExtension(info.Name, ".pdf")),
                             FinalPdfPath = Path.Combine(Path.GetDirectoryName(file)!, Path.ChangeExtension(info.Name, ".pdf"))
                         });
                     }

@@ -37,7 +37,7 @@ namespace PublisherConverter.Core
         {
             if (string.IsNullOrEmpty(_stagingDirectory) || !Directory.Exists(_stagingDirectory)) return;
 
-            string targetedSubFolder = Path.Combine(_stagingDirectory, relativePath.TrimStart('\\'));
+            string targetedSubFolder = Path.Combine(_stagingDirectory, relativePath.TrimStart('\\', '/'));
 
             if (!Directory.Exists(targetedSubFolder))
             {
