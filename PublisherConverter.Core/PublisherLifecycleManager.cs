@@ -15,7 +15,6 @@ namespace PublisherConverter.Core
         private readonly int _maxConsecutiveFailures;
         private readonly object _stateLock = new object();
 
-        // The active isolated worker apartment instance
         private WorkerApartment? _activeWorker;
 
         public PublisherLifecycleManager(int maxConsecutiveFailures = 3)
@@ -42,6 +41,29 @@ namespace PublisherConverter.Core
             }
         }
 
+        // FIX: Dedicated batch-level tracking hooks to separate single attempts from global file results
+        public void RecordBatchSuccess()
+        {
+            lock (_stateLock)
+            {
+                _consecutiveFailureCount = 0;
+            }
+        }
+
+        public void RecordBatchFailure()
+        {
+            lock (_stateLock)
+            {
+                _consecutiveFailureCount++;
+                if (_consecutiveFailureCount >= _maxConsecutiveFailures)
+                {
+                    throw new InvalidOperationException(
+                        $"Automation engine circuit breaker tripped. {_consecutiveFailureCount} separate files " +
+                        $"have failed completely in a row. Aborting execution batch to protect system resources.");
+                }
+            }
+        }
+
         public void ExecuteRenderingJob(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
         {
             lock (_stateLock)
@@ -54,26 +76,19 @@ namespace PublisherConverter.Core
 
                 try
                 {
-                    // Pass execution down into the cleanly isolated thread apartment container
                     _activeWorker.ExecuteJob(record, sourcePubPath, targetPdfPath, runLinkCheck, timeoutSeconds, cancellationToken);
-
-                    // On a verified success, reset the consecutive failure counter
-                    _consecutiveFailureCount = 0;
                 }
                 catch (Exception)
                 {
-                    // An exception occurred (timeout, crash, or COM channel fault). 
-                    // Sever all ties to the dead apartment and destroy its process footprints immediately.
+                    // FIX: Clean up the broken apartment wrapper and rethrow immediately.
+                    // We no longer call RecordFailure() here, preventing local file retries from inflating the global batch score.
                     _activeWorker?.ForceTeardown();
-                    _activeWorker = null; // Discard completely to let GC collect its synchronization events
+                    _activeWorker = null;
 
-                    RecordFailure(); // Increment circuit breaker thresholds
-
-                    // Pre-instantiate a clean replacement apartment container for the next queue file/retry attempt
                     _activeWorker = new WorkerApartment();
                     _activeWorker.Start();
 
-                    throw; // Rethrow to let ConverterEngine execute its file-level retry strategies
+                    throw;
                 }
             }
         }
@@ -98,20 +113,6 @@ namespace PublisherConverter.Core
             }
         }
 
-        private void RecordFailure()
-        {
-            _consecutiveFailureCount++;
-            if (_consecutiveFailureCount >= _maxConsecutiveFailures)
-            {
-                throw new InvalidOperationException(
-                    $"Automation engine circuit breaker tripped. Headless Publisher process failed " +
-                    $"to initialize {_consecutiveFailureCount} times consecutively. Aborting execution batch to protect system resources.");
-            }
-        }
-
-        /// <summary>
-        /// Fully encapsulated, self-contained STA Thread Apartment environment.
-        /// </summary>
         private class WorkerApartment
         {
             private readonly AutoResetEvent _jobReadyEvent = new AutoResetEvent(false);
@@ -261,7 +262,7 @@ namespace PublisherConverter.Core
 
             public void ForceTeardown()
             {
-                _isTerminated = true; // Signals loop termination to this thread container specifically
+                _isTerminated = true;
                 _isTeardownIntentional = true;
 
                 if (_trackedProcess != null)
@@ -270,7 +271,7 @@ namespace PublisherConverter.Core
                     _trackedProcess = null;
                 }
 
-                _jobReadyEvent.Set(); // Wakes thread up out of wait state to process closure if sleeping
+                _jobReadyEvent.Set();
 
                 int currentSessionId = System.Diagnostics.Process.GetCurrentProcess().SessionId;
 

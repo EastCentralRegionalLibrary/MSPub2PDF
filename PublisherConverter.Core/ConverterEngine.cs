@@ -13,7 +13,6 @@ namespace PublisherConverter.Core
         {
             var tcs = new TaskCompletionSource();
 
-            // The orchestrator thread manages the file batch queue, completely decoupled from COM handles
             var orchestratorThread = new Thread(() =>
             {
                 var report = new ProgressReport();
@@ -21,7 +20,6 @@ namespace PublisherConverter.Core
                 var indexedFiles = new List<FileRecord>();
                 ArchiveService? archiveService = null;
 
-                // Instantiate the lifecycle manager with a 3-strike consecutive file crash rule
                 var lifecycleManager = new PublisherLifecycleManager(maxConsecutiveFailures: 3);
 
                 if (!string.IsNullOrEmpty(options.ArchivePath))
@@ -75,7 +73,6 @@ namespace PublisherConverter.Core
                         });
                     }
 
-                    // Bootstrap the isolated background worker apartment container
                     lifecycleManager.InitializeEngine();
 
                     // Phase 2: Processing Loop
@@ -86,7 +83,7 @@ namespace PublisherConverter.Core
                             throw new OperationCanceledException(cancellationToken);
                         }
 
-                        // Step A: Static Triage (Inspect without mounting the COM engine)
+                        // Step A: Static Triage
                         var safety = PublisherInspector.InspectFile(record.OriginalFullPath);
                         if (safety.IsPasswordProtected || safety.IsCorruptedOrInvalid)
                         {
@@ -100,7 +97,7 @@ namespace PublisherConverter.Core
                         }
                         record.SourceHash = GetSha256Hash(record.OriginalFullPath);
 
-                        // Step B: Ingress Staging (Local Copying)
+                        // Step B: Ingress Staging
                         try
                         {
                             string localDir = Path.GetDirectoryName(record.LocalPubPath)!;
@@ -121,6 +118,7 @@ namespace PublisherConverter.Core
 
                         const int maxFileAttempts = 3;
                         bool renderingSucceeded = false;
+                        Exception? lastRenderingException = null;
 
                         // Intra-File Local Retry Loop
                         for (int attempt = 1; attempt <= maxFileAttempts; attempt++)
@@ -132,12 +130,9 @@ namespace PublisherConverter.Core
 
                             try
                             {
-                                // Dispatch the file variables down to the isolated worker apartment
                                 lifecycleManager.ExecuteRenderingJob(record, record.LocalPubPath, record.LocalPdfPath, options.RunLinkCheck, options.FileTimeoutSeconds, cancellationToken);
-
                                 renderingSucceeded = true;
-                                record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
-                                break; // Rendering succeeded; break out of the local retry attempts loop
+                                break;
                             }
                             catch (OperationCanceledException)
                             {
@@ -145,28 +140,36 @@ namespace PublisherConverter.Core
                             }
                             catch (Exception ex)
                             {
-                                // REFACTOR: Intercept the sequential circuit breaker exception.
-                                // Rethrow instantly to escape the retry loop and queue to trigger an orderly cleanup.
-                                if (ex.Message.Contains("circuit breaker tripped"))
-                                {
-                                    throw;
-                                }
+                                lastRenderingException = ex;
 
                                 if (attempt < maxFileAttempts)
                                 {
                                     record.Details = $"Attempt {attempt} thrown out ({ex.GetType().Name}). Accessing local retry block...";
                                     continue;
                                 }
-
-                                // All local retry options exhausted for this file
-                                record.Status = MigrationStatus.FailedConversion;
-                                record.Details = ex is TimeoutException
-                                    ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
-                                    : $"COM Rendering Exception: {ex.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
                             }
                         }
 
-                        // Step C: Egress & Metadata Cloning
+                        // FIX: Evaluate execution resolution OUTSIDE the attempt loop to calculate the proper global health metric
+                        if (renderingSucceeded)
+                        {
+                            // File converted perfectly on one of its local retries. Clear the global strike counter!
+                            lifecycleManager.RecordBatchSuccess();
+                            record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
+                        }
+                        else
+                        {
+                            // FIX: The file has completely exhausted all 3 local retries. Record a batch strike.
+                            // If 3 completely different files do this back-to-back, this call trips the circuit breaker and stops the run.
+                            lifecycleManager.RecordBatchFailure();
+
+                            record.Status = MigrationStatus.FailedConversion;
+                            record.Details = lastRenderingException is TimeoutException
+                                ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
+                                : $"COM Rendering Exception: {lastRenderingException?.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
+                        }
+
+                        // Step C: Egress & Metadata Output Cloning
                         if (renderingSucceeded)
                         {
                             try
@@ -201,7 +204,6 @@ namespace PublisherConverter.Core
                             }
                         }
 
-                        // Update metrics tracking
                         if (record.Status == MigrationStatus.VerifiedComplete) report.SuccessCount++;
                         else if (record.Status == MigrationStatus.VerifiedWithWarnings) report.WarningCount++;
                         else report.FailureCount++;
@@ -241,7 +243,6 @@ namespace PublisherConverter.Core
                 }
                 finally
                 {
-                    // Gracefully shutdown the engine and clear local workspace structures
                     lifecycleManager.ShutdownEngine();
                     if (Directory.Exists(scratchRoot))
                     {
