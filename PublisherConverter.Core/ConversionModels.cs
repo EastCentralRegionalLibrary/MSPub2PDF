@@ -51,5 +51,6 @@ namespace PublisherConverter.Core
         public bool CompressArchive { get; set; } = false;
         public bool DeleteSourceOnSuccess { get; set; } = false;
         public int ProcessRecycleInterval { get; set; } = 50;
+        public int FileTimeoutSeconds { get; set; } = 60;
     }
 }

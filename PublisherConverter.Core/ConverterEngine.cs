@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,6 +26,19 @@ namespace PublisherConverter.Core
             var report = new ProgressReport();
             string scratchRoot = Path.Combine(Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\", "_pubscratch");
             var indexedFiles = new List<FileRecord>();
+            ArchiveService? archiveService = null;
+            if (!string.IsNullOrEmpty(options.ArchivePath))
+            {
+                try
+                {
+                    archiveService = new ArchiveService(options.ArchivePath);
+                    archiveService.Initialize();
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException($"Failed to instantiate archive layout frameworks: {ex.Message}", ex);
+                }
+            }
 
             try
             {
@@ -103,45 +117,75 @@ namespace PublisherConverter.Core
 
                     // Step C: Link Audit & Conversion Rendering
                     Document? doc = null;
-                    try
-                    {
-                        lock (_comLock)
-                        {
-                            // FIX (CS1739): Cleaned up type signature arguments matching Publisher's API rules
-                            doc = _pubApp!.Open(Filename: record.LocalPubPath, ReadOnly: true);
+                    bool processingTimedOut = false;
 
-                            if (options.RunLinkCheck)
+                    using (var timeoutCts = new CancellationTokenSource())
+                    {
+                        // Spawn a background timer task that monitors this file's rendering progress
+                        var watchdogTask = Task.Delay(TimeSpan.FromSeconds(options.FileTimeoutSeconds), timeoutCts.Token)
+                            .ContinueWith(t =>
                             {
-                                AuditDocumentLinks(doc, record);
+                                // If the delay task finishes naturally without being cancelled, a hang occurred!
+                                if (!t.IsCanceled)
+                                {
+                                    processingTimedOut = true;
+                                    KillPublisherProcesses(); // Forcefully kill mspub.exe to unblock the main thread
+                                }
+                            });
+                        try
+                        {
+                            lock (_comLock)
+                            {
+                                // FIX (CS1739): Cleaned up type signature arguments matching Publisher's API rules
+                                doc = _pubApp!.Open(Filename: record.LocalPubPath, ReadOnly: true);
+
+                                if (options.RunLinkCheck)
+                                {
+                                    AuditDocumentLinks(doc, record);
+                                }
+
+                                archiveService?.StageFile(record.OriginalFullPath, record.RelativePath, record.FileName);
+
+                                // Force strict PDF/A alignment matching commercial layout rules
+                                doc.ExportAsFixedFormat(
+                                    Format: PbFixedFormatType.pbFixedFormatTypePDF,
+                                    Filename: record.LocalPdfPath,
+                                    Intent: PbFixedFormatIntent.pbIntentCommercial,
+                                    IncludeDocumentProperties: true,
+                                    DocStructureTags: true,
+                                    BitmapMissingFonts: true,
+                                    UseISO19005_1: true // Enforces PDF/A Archival standard
+                                );
                             }
 
-                            // Force strict PDF/A alignment matching commercial layout rules
-                            doc.ExportAsFixedFormat(
-                                Format: PbFixedFormatType.pbFixedFormatTypePDF,
-                                Filename: record.LocalPdfPath,
-                                Intent: PbFixedFormatIntent.pbIntentCommercial,
-                                IncludeDocumentProperties: true,
-                                DocStructureTags: true,
-                                BitmapMissingFonts: true,
-                                UseISO19005_1: true // Enforces PDF/A Archival standard
-                            );
+                            timeoutCts.Cancel();
+                            record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
                         }
-
-                        record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
-                    }
-                    catch (Exception ex)
-                    {
-                        record.Status = MigrationStatus.FailedConversion;
-                        record.Details = $"COM Rendering Exception: {ex.Message.Trim()}";
-                    }
-                    finally
-                    {
-                        lock (_comLock)
+                        catch (Exception ex)
                         {
-                            if (doc != null)
+                            timeoutCts.Cancel(); // Ensure timer task resources release safely
+
+                            if (processingTimedOut)
                             {
-                                doc.Close();
-                                System.Runtime.InteropServices.Marshal.ReleaseComObject(doc);
+                                record.Status = MigrationStatus.FailedConversion;
+                                record.Details = $"Execution Timeout: Exceeded allocated limits of {options.FileTimeoutSeconds}s. Underlying engine process terminated.";
+                                _pubApp = null; // Clear instance variable to trigger fresh initialization on next loop pass
+                            }
+                            else
+                            {
+                                record.Status = MigrationStatus.FailedConversion;
+                                record.Details = $"COM Rendering Exception: {ex.Message.Trim()}";
+                            }
+                        }
+                        finally
+                        {
+                            lock (_comLock)
+                            {
+                                if (doc != null)
+                                {
+                                    doc.Close();
+                                    System.Runtime.InteropServices.Marshal.ReleaseComObject(doc);
+                                }
                             }
                         }
                     }
@@ -195,6 +239,11 @@ namespace PublisherConverter.Core
                     {
                         RecyclePublisherProcess(progress);
                     }
+                }
+                if (archiveService != null)
+                {
+                    progress.Report(new ProgressReport { CurrentActionMessage = "Compressing historical archive repository to ZIP container..." });
+                    archiveService.FinalizeArchive();
                 }
 
                 // Phase 4: Optional Purges
@@ -252,6 +301,18 @@ namespace PublisherConverter.Core
             }
         }
 
+        private void KillPublisherProcesses()
+        {
+            foreach (var process in Process.GetProcessesByName("mspub"))
+            {
+                try
+                {
+                    process.Kill();
+                    process.WaitForExit(5000); // Allow 5 seconds for OS cleanup routines to bind
+                }
+                catch { }
+            }
+        }
         private void AuditDocumentLinks(Document doc, FileRecord record)
         {
             var brokenAssets = new List<string>();
