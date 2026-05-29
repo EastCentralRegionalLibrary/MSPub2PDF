@@ -10,6 +10,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <SupportedOSPlatform>windows</SupportedOSPlatform>
+    <NoWarn>$(NoWarn);NU1701;NU1902</NoWarn>
   </PropertyGroup>
 
 </Project>
