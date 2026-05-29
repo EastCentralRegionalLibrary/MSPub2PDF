@@ -18,6 +18,7 @@ namespace PublisherConverter.Core
         // Cross-apartment thread synchronization event wires
         private readonly AutoResetEvent _jobReadyEvent = new AutoResetEvent(false);
         private readonly AutoResetEvent _jobFinishedEvent = new AutoResetEvent(false);
+        private readonly AutoResetEvent _processExitedEvent = new AutoResetEvent(false); // NEW: Event signal for process crashes
 
         // Context parameters exchanged between master engine loops and worker apartment
         private string? _sourcePubPath;
@@ -26,8 +27,10 @@ namespace PublisherConverter.Core
         private FileRecord? _currentRecord;
 
         private Application? _sharedPubApp;
+        private System.Diagnostics.Process? _trackedProcess; // NEW: Explicitly track the Process lifecycle object
         private Exception? _workerException;
         private bool _isWorkerTerminated = false;
+        private bool _isTeardownIntentional = false; // NEW: Flag to distinguish a crash from a clean cleanup
         private Thread? _workerThread;
 
         public PublisherLifecycleManager(int maxConsecutiveFailures = 3)
@@ -35,9 +38,6 @@ namespace PublisherConverter.Core
             _maxConsecutiveFailures = maxConsecutiveFailures;
         }
 
-        /// <summary>
-        /// Bootstraps the thread apartment structures and warms up initial background automation processes.
-        /// </summary>
         public void InitializeEngine()
         {
             lock (_stateLock)
@@ -47,22 +47,19 @@ namespace PublisherConverter.Core
             }
         }
 
-        /// <summary>
-        /// Gracefully deconstructs and purges active native background environment modules.
-        /// </summary>
         public void ShutdownEngine()
         {
             lock (_stateLock)
             {
                 _isWorkerTerminated = true;
-                _jobReadyEvent.Set(); // Releases loop out of blocking state if active
+                _jobReadyEvent.Set();
                 ForceTeardown();
                 _sharedPubApp = null;
             }
         }
 
         /// <summary>
-        /// Submits staged source file parameters down to the isolated worker container window block for execution.
+        /// Submits a job and uses low-level Win32 kernel wait handles to listen for events reactively.
         /// </summary>
         public void ExecuteRenderingJob(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
         {
@@ -73,58 +70,63 @@ namespace PublisherConverter.Core
                 _runLinkCheck = runLinkCheck;
                 _currentRecord = record;
                 _workerException = null;
+                _isTeardownIntentional = false;
 
-                // Signal proxy worker thread apartment container to pick up execution properties
+                // Clear out any stale signaling frames before beginning execution pass
+                _jobFinishedEvent.Reset();
+                _processExitedEvent.Reset();
+
                 _jobReadyEvent.Set();
 
-                // Low-level kernel signal window wait block
-                int waitSignalIndex = WaitHandle.WaitAny(new WaitHandle[] { _jobFinishedEvent, cancellationToken.WaitHandle }, TimeSpan.FromSeconds(timeoutSeconds));
+                // EVENT-DRIVEN KERNEL WAIT BLOCK
+                // The OS puts this thread to sleep at 0% CPU, waking it instantly if any handle triggers or the timeout expires.
+                int waitSignalIndex = WaitHandle.WaitAny(new WaitHandle[] {
+                    _jobFinishedEvent,
+                    _processExitedEvent,
+                    cancellationToken.WaitHandle
+                }, TimeSpan.FromSeconds(timeoutSeconds));
 
                 if (waitSignalIndex == WaitHandle.WaitTimeout)
                 {
-                    ForceTeardown();
+                    // Case 1: The process hung or exceeded its timeout limit
+                    CleanResetDeadWorker();
                     RecordFailure();
-
-                    _isWorkerTerminated = true;
-                    _jobReadyEvent.Set();
-                    _sharedPubApp = null;
-
-                    // Discard the frozen thread context and spin up a replacement proxy container
-                    _workerThread = StartNewActiveWorkerApartment();
-
                     throw new TimeoutException($"Headless rendering execution window threshold of {timeoutSeconds}s exceeded.");
                 }
 
-                if (waitSignalIndex == 1) // CancellationToken triggered by Abort button
+                if (waitSignalIndex == 2)
                 {
+                    // Case 2: Manual User Abort button clicked
                     _isWorkerTerminated = true;
                     _jobReadyEvent.Set();
                     ForceTeardown();
                     throw new OperationCanceledException(cancellationToken);
                 }
 
-                // Evaluate processing worker thread results
+                if (waitSignalIndex == 1)
+                {
+                    // Case 3: ProcessExitedEvent fired (The background application crashed instantly)
+                    CleanResetDeadWorker();
+                    RecordFailure();
+                    throw new InvalidOperationException("The underlying Microsoft Publisher background process crashed unexpectedly.");
+                }
+
+                // Case 4: Job completed successfully. Evaluate any inner managed exceptions.
                 if (_workerException != null)
                 {
-                    ForceTeardown();
-                    _sharedPubApp = null;
+                    CleanResetDeadWorker();
                     RecordFailure();
-
-                    // Rethrow exception context back up to Master Engine loop to handle local file retries
                     throw _workerException;
                 }
 
-                // Any successful rendering clears the machine-level circuit breaker counter
+                // Reset the system-level sequential fault circuit breaker
                 _consecutiveFailureCount = 0;
             }
         }
 
         private Thread StartNewActiveWorkerApartment()
         {
-            // FIX: Explicitly clear the termination flag context state before kicking off the new thread.
-            // This prevents the replacement thread from reading a stale 'true' flag and exiting immediately at boot.
             _isWorkerTerminated = false;
-
             var thread = new Thread(DedicatedWorkerApartmentLoop);
             thread.SetApartmentState(ApartmentState.STA);
             thread.IsBackground = true;
@@ -145,34 +147,46 @@ namespace PublisherConverter.Core
                     {
                         _sharedPubApp = new Application();
                         _sharedPubApp.AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityForceDisable;
-                    }
 
-                    Document? doc = null;
-                    try
-                    {
-                        doc = _sharedPubApp.Open(Filename: _sourcePubPath, ReadOnly: true);
-
-                        if (_runLinkCheck && _currentRecord != null)
+                        // EVENT SUBSCRIPTION: Fetch the native process container and subscribe to its exit signal
+                        int pid = GetCurrentSessionNewestPublisherPid();
+                        if (pid != 0)
                         {
-                            AuditDocumentLinks(doc, _currentRecord);
+                            _trackedProcess = System.Diagnostics.Process.GetProcessById(pid);
+                            _trackedProcess.EnableRaisingEvents = true;
+                            _trackedProcess.Exited += OnPublisherProcessExited;
                         }
-
-                        doc.ExportAsFixedFormat(
-                            Format: PbFixedFormatType.pbFixedFormatTypePDF,
-                            Filename: _targetPdfPath,
-                            Intent: PbFixedFormatIntent.pbIntentCommercial,
-                            IncludeDocumentProperties: true,
-                            DocStructureTags: true,
-                            BitmapMissingFonts: true,
-                            UseISO19005_1: true
-                        );
                     }
-                    finally
+
+                    if (_sourcePubPath != null && _targetPdfPath != null)
                     {
-                        if (doc != null)
+                        Document? doc = null;
+                        try
                         {
-                            try { doc.Close(); Marshal.ReleaseComObject(doc); } catch { }
-                            doc = null;
+                            doc = _sharedPubApp.Open(Filename: _sourcePubPath, ReadOnly: true);
+
+                            if (_runLinkCheck && _currentRecord != null)
+                            {
+                                AuditDocumentLinks(doc, _currentRecord);
+                            }
+
+                            doc.ExportAsFixedFormat(
+                                Format: PbFixedFormatType.pbFixedFormatTypePDF,
+                                Filename: _targetPdfPath,
+                                Intent: PbFixedFormatIntent.pbIntentCommercial,
+                                IncludeDocumentProperties: true,
+                                DocStructureTags: true,
+                                BitmapMissingFonts: true,
+                                UseISO19005_1: true
+                            );
+                        }
+                        finally
+                        {
+                            if (doc != null)
+                            {
+                                try { doc.Close(); Marshal.ReleaseComObject(doc); } catch { }
+                                doc = null;
+                            }
                         }
                     }
                 }
@@ -182,7 +196,7 @@ namespace PublisherConverter.Core
                 }
                 finally
                 {
-                    _jobFinishedEvent.Set(); // Notify Master thread wait loop context
+                    _jobFinishedEvent.Set();
                 }
             }
 
@@ -191,6 +205,57 @@ namespace PublisherConverter.Core
                 try { _sharedPubApp.Quit(); Marshal.ReleaseComObject(_sharedPubApp); } catch { }
                 _sharedPubApp = null;
             }
+        }
+
+        /// <summary>
+        /// Reactor callback executed automatically by the OS threadpool the exact millisecond mspub exits or crashes.
+        /// </summary>
+        private void OnPublisherProcessExited(object? sender, EventArgs e)
+        {
+            // If we are intentionally tearing down the engine, ignore this signal callback
+            if (_isTeardownIntentional) return;
+
+            // Signal the master loop thread that the process crashed
+            _processExitedEvent.Set();
+        }
+
+        private void CleanResetDeadWorker()
+        {
+            ForceTeardown();
+
+            _isWorkerTerminated = true;
+            _jobReadyEvent.Set();
+            _sharedPubApp = null;
+
+            _workerThread = StartNewActiveWorkerApartment();
+        }
+
+        private int GetCurrentSessionNewestPublisherPid()
+        {
+            try
+            {
+                int currentSessionId = System.Diagnostics.Process.GetCurrentProcess().SessionId;
+                System.Diagnostics.Process? newestProc = null;
+                DateTime newestTime = DateTime.MinValue;
+
+                foreach (var proc in System.Diagnostics.Process.GetProcessesByName("mspub"))
+                {
+                    try
+                    {
+                        if (proc.SessionId == currentSessionId)
+                        {
+                            if (newestProc == null || proc.StartTime > newestTime)
+                            {
+                                newestProc = proc;
+                                newestTime = proc.StartTime;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                return newestProc?.Id ?? 0;
+            }
+            catch { return 0; }
         }
 
         private void AuditDocumentLinks(Document doc, FileRecord record)
@@ -263,14 +328,22 @@ namespace PublisherConverter.Core
 
         public void ForceTeardown()
         {
-            int currentSessionId = Process.GetCurrentProcess().SessionId;
+            _isTeardownIntentional = true; // Set flag to inhibit event loop race callbacks
 
-            foreach (var process in Process.GetProcessesByName("mspub"))
+            if (_trackedProcess != null)
+            {
+                try { _trackedProcess.Exited -= OnPublisherProcessExited; } catch { }
+                _trackedProcess = null;
+            }
+
+            int currentSessionId = System.Diagnostics.Process.GetCurrentProcess().SessionId;
+
+            foreach (var process in System.Diagnostics.Process.GetProcessesByName("mspub"))
             {
                 try { if (process.SessionId == currentSessionId) { process.Kill(); process.WaitForExit(2000); } } catch (Exception ex) when (ex is Win32Exception || ex is InvalidOperationException) { }
             }
 
-            foreach (var process in Process.GetProcessesByName("WerFault"))
+            foreach (var process in System.Diagnostics.Process.GetProcessesByName("WerFault"))
             {
                 try { if (process.SessionId == currentSessionId) { process.Kill(); } } catch (Exception ex) when (ex is Win32Exception || ex is InvalidOperationException) { }
             }
