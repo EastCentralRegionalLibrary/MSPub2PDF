@@ -11,11 +11,24 @@ namespace PublisherConverter.GUI
     public partial class MainWindow : Window
     {
         private CancellationTokenSource? _cts;
-        private readonly ConverterEngine _engine = new ConverterEngine();
+        private readonly ConverterEngine _engine;
 
         public MainWindow()
         {
             InitializeComponent();
+
+            var inspector = new PublisherInspector();
+            var hashProvider = new HashProvider();
+            var manifestWriter = new ManifestWriter();
+            var renderer = new PublisherLifecycleManager();
+
+            _engine = new ConverterEngine(
+                inspector,
+                hashProvider,
+                manifestWriter,
+                renderer,
+                (path, compress) => new ArchiveService(path, compress)
+            );
         }
 
         // Folder Picker helper logic using standard Windows Dialog hooks
@@ -46,6 +59,12 @@ namespace PublisherConverter.GUI
             {
                 // FIX: Changed MessageBoxIcon to MessageBoxImage.Warning
                 MessageBox.Show("Please enter a valid positive integer value for the engine recycle limit.", "Configuration Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (!int.TryParse(TxtTimeout.Text, out int timeoutSeconds) || timeoutSeconds <= 0)
+            {
+                MessageBox.Show("Please enter a valid positive integer value for the file timeout.", "Configuration Error", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -85,7 +104,9 @@ namespace PublisherConverter.GUI
                 ArchivePath = TxtArchivePath.Text.Trim(),
                 RunLinkCheck = ChkRunLinkCheck.IsChecked ?? true,
                 DeleteSourceOnSuccess = ChkDeleteSource.IsChecked ?? false,
-                ProcessRecycleInterval = recycleInterval
+                ProcessRecycleInterval = recycleInterval,
+                CompressArchive = ChkCompressArchive.IsChecked ?? true,
+                FileTimeoutSeconds = timeoutSeconds
             };
 
             try
@@ -139,6 +160,8 @@ namespace PublisherConverter.GUI
             ChkRunLinkCheck.IsEnabled = !isRunning;
             ChkDeleteSource.IsEnabled = !isRunning;
             TxtRecycleInterval.IsEnabled = !isRunning;
+            ChkCompressArchive.IsEnabled = !isRunning;
+            TxtTimeout.IsEnabled = !isRunning;
         }
 
         private void AppendConsoleLog(string message)

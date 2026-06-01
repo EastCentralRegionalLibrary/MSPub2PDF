@@ -9,20 +9,24 @@ using Microsoft.Office.Interop.Publisher;
 
 namespace PublisherConverter.Core
 {
-    public class PublisherLifecycleManager
+    public class PublisherLifecycleManager : IPublisherRenderer
     {
+        public const int DefaultMaxConsecutiveFailures = 3;
+        public const int DefaultMaxFileAttempts = 3;
+        public const int DefaultFileTimeoutSeconds = 60;
+
         private int _consecutiveFailureCount = 0;
         private readonly int _maxConsecutiveFailures;
         private readonly object _stateLock = new object();
 
         private WorkerApartment? _activeWorker;
 
-        public PublisherLifecycleManager(int maxConsecutiveFailures = 3)
+        public PublisherLifecycleManager(int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
         {
             _maxConsecutiveFailures = maxConsecutiveFailures;
         }
 
-        public void InitializeEngine()
+        public void Initialize()
         {
             lock (_stateLock)
             {
@@ -32,7 +36,7 @@ namespace PublisherConverter.Core
             }
         }
 
-        public void ShutdownEngine()
+        public void Shutdown()
         {
             lock (_stateLock)
             {
@@ -41,7 +45,18 @@ namespace PublisherConverter.Core
             }
         }
 
-        // FIX: Dedicated batch-level tracking hooks to separate single attempts from global file results
+        public void Recycle()
+        {
+            lock (_stateLock)
+            {
+                _activeWorker?.Shutdown();
+                _activeWorker = null;
+
+                _activeWorker = new WorkerApartment();
+                _activeWorker.Start();
+            }
+        }
+
         public void RecordBatchSuccess()
         {
             lock (_stateLock)
@@ -50,22 +65,26 @@ namespace PublisherConverter.Core
             }
         }
 
-        public void RecordBatchFailure()
+        public bool RecordBatchFailure()
         {
             lock (_stateLock)
             {
                 _consecutiveFailureCount++;
-                if (_consecutiveFailureCount >= _maxConsecutiveFailures)
-                {
-                    throw new InvalidOperationException(
-                        $"Automation engine circuit breaker tripped. {_consecutiveFailureCount} separate files " +
-                        $"have failed completely in a row. Aborting execution batch to protect system resources.");
-                }
+                return _consecutiveFailureCount >= _maxConsecutiveFailures;
             }
         }
 
-        public void ExecuteRenderingJob(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
+        public int ConsecutiveFailures
         {
+            get
+            {
+                lock (_stateLock) return _consecutiveFailureCount;
+            }
+        }
+
+        public async Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
+        {
+            WorkerApartment? worker;
             lock (_stateLock)
             {
                 if (_activeWorker == null)
@@ -73,23 +92,28 @@ namespace PublisherConverter.Core
                     _activeWorker = new WorkerApartment();
                     _activeWorker.Start();
                 }
+                worker = _activeWorker;
+            }
 
-                try
+            try
+            {
+                await Task.Run(() => worker.ExecuteJob(record, sourcePubPath, targetPdfPath, runLinkCheck, timeoutSeconds, cancellationToken), cancellationToken);
+            }
+            catch (Exception)
+            {
+                lock (_stateLock)
                 {
-                    _activeWorker.ExecuteJob(record, sourcePubPath, targetPdfPath, runLinkCheck, timeoutSeconds, cancellationToken);
-                }
-                catch (Exception)
-                {
-                    // FIX: Clean up the broken apartment wrapper and rethrow immediately.
-                    // We no longer call RecordFailure() here, preventing local file retries from inflating the global batch score.
-                    _activeWorker?.ForceTeardown();
-                    _activeWorker = null;
+                    if (_activeWorker == worker)
+                    {
+                        _activeWorker?.ForceTeardown();
+                        _activeWorker = null;
 
-                    _activeWorker = new WorkerApartment();
-                    _activeWorker.Start();
-
-                    throw;
+                        _activeWorker = new WorkerApartment();
+                        _activeWorker.Start();
+                    }
                 }
+
+                throw;
             }
         }
 

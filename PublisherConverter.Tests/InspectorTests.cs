@@ -10,6 +10,8 @@ namespace PublisherConverter.Tests
     public class InspectorTests : IDisposable
     {
         private readonly string _testWorkspaceDir;
+        private readonly PublisherInspector _inspector = new PublisherInspector();
+        private readonly HashProvider _hashProvider = new HashProvider();
 
         public InspectorTests()
         {
@@ -27,7 +29,7 @@ namespace PublisherConverter.Tests
             string fakePubPath = Path.Combine(_testWorkspaceDir, "plain_text.pub");
             File.WriteAllText(fakePubPath, "This is not an OLE compound file structure.");
 
-            var result = PublisherInspector.InspectFile(fakePubPath);
+            var result = _inspector.InspectFile(fakePubPath);
 
             Assert.True(result.IsCorruptedOrInvalid);
             Assert.Contains("Invalid file layout", result.Reason);
@@ -43,7 +45,7 @@ namespace PublisherConverter.Tests
                 cf.SaveAs(cleanPubPath);
             }
 
-            var result = PublisherInspector.InspectFile(cleanPubPath);
+            var result = _inspector.InspectFile(cleanPubPath);
 
             Assert.False(result.HasMacros);
             Assert.False(result.IsPasswordProtected);
@@ -62,7 +64,7 @@ namespace PublisherConverter.Tests
                 cf.SaveAs(macroPubPath);
             }
 
-            var result = PublisherInspector.InspectFile(macroPubPath);
+            var result = _inspector.InspectFile(macroPubPath);
 
             Assert.True(result.HasMacros);
             Assert.Contains("contains active VBA macros", result.Reason);
@@ -74,8 +76,8 @@ namespace PublisherConverter.Tests
             string targetFile = Path.Combine(_testWorkspaceDir, "hash_test.txt");
             await File.WriteAllTextAsync(targetFile, "East Central Regional Library System Migration 2026");
 
-            string hashFirstPass = ConverterEngine.GetSha256Hash(targetFile);
-            string hashSecondPass = ConverterEngine.GetSha256Hash(targetFile);
+            string hashFirstPass = _hashProvider.GetSha256Hash(targetFile);
+            string hashSecondPass = _hashProvider.GetSha256Hash(targetFile);
 
             Assert.Equal(64, hashFirstPass.Length);
             Assert.Equal(hashFirstPass, hashSecondPass);
@@ -88,7 +90,7 @@ namespace PublisherConverter.Tests
             string nonExistentPath = Path.Combine(_testWorkspaceDir, "ghost_file.pub");
 
             // Act: Attempt triage
-            var result = PublisherInspector.InspectFile(nonExistentPath);
+            var result = _inspector.InspectFile(nonExistentPath);
 
             // Assert: Verify the engine flags it gracefully before wasting resources
             Assert.True(result.IsCorruptedOrInvalid);
@@ -108,7 +110,7 @@ namespace PublisherConverter.Tests
             }
 
             // Act: Triage the document
-            var result = PublisherInspector.InspectFile(legacyMacroPath);
+            var result = _inspector.InspectFile(legacyMacroPath);
 
             // Assert: Confirm the engine catches both modern and legacy structural layouts
             Assert.True(result.HasMacros);
@@ -127,7 +129,7 @@ namespace PublisherConverter.Tests
             string sourceFileFake = Path.Combine(_testWorkspaceDir, "original_template.pub");
             File.WriteAllText(sourceFileFake, "Fake Publisher Binary Stream Content Context Data Block");
 
-            var archiveSvc = new ArchiveService(backupTargetDir);
+            var archiveSvc = new ArchiveService(backupTargetDir, compress: true);
 
             // Act - Part A: Initialize backup staging spaces
             archiveSvc.Initialize();

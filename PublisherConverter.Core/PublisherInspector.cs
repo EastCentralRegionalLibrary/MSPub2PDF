@@ -12,9 +12,9 @@ namespace PublisherConverter.Core
         public string Reason { get; set; } = "Clean";
     }
 
-    public static class PublisherInspector
+    public class PublisherInspector : IFileInspector
     {
-        public static FileSafetyStatus InspectFile(string filePath)
+        public FileSafetyStatus InspectFile(string filePath)
         {
             var status = new FileSafetyStatus();
 
@@ -25,7 +25,7 @@ namespace PublisherConverter.Core
                 return status;
             }
 
-            // FIX 2: Explicitly catch zero-byte files before parsing headers
+            // Explicitly catch zero-byte files before parsing headers
             var fileInfo = new FileInfo(filePath);
             if (fileInfo.Length == 0)
             {
@@ -46,22 +46,21 @@ namespace PublisherConverter.Core
                     // Traverse internal structural entries safely using a callback delegate
                     cf.RootStorage.VisitEntries(item =>
                     {
-                        // FIX 3: Short-circuit string matching if a signature has already been flagged
-                        if (macroFound || encryptionFound) return;
+                        // Short-circuit string matching if a signature has already been flagged
+                        if (macroFound && encryptionFound) return;
 
                         string name = item.Name;
 
                         // Check for embedded VBA scripts
-                        if (name.Equals("VBA", StringComparison.OrdinalIgnoreCase) ||
-                            name.Equals("_VBA_PROJECT_CUR", StringComparison.OrdinalIgnoreCase))
+                        if (!macroFound && (name.Equals("VBA", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals("_VBA_PROJECT_CUR", StringComparison.OrdinalIgnoreCase)))
                         {
                             macroFound = true;
-                            return;
                         }
 
-                        // FIX 1: Proactively flag standard uncompressed OLE password envelopes
-                        if (name.Equals("EncryptionInfo", StringComparison.OrdinalIgnoreCase) ||
-                            name.Equals("EncryptedPackage", StringComparison.OrdinalIgnoreCase))
+                        // Flag standard OLE encryption headers
+                        if (!encryptionFound && (name.Equals("EncryptionInfo", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals("EncryptedPackage", StringComparison.OrdinalIgnoreCase)))
                         {
                             encryptionFound = true;
                         }
@@ -72,31 +71,25 @@ namespace PublisherConverter.Core
                     {
                         status.IsPasswordProtected = true;
                         status.Reason = "File is password protected (Contains standard OLE encryption headers).";
-                        return status;
                     }
 
                     if (macroFound)
                     {
                         status.HasMacros = true;
-                        status.Reason = "Document contains active VBA macros.";
-                        return status;
+                        if (!encryptionFound)
+                        {
+                            status.Reason = "Document contains active VBA macros.";
+                        }
                     }
+
+                    if (macroFound || encryptionFound) return status;
                 }
             }
-            // Catch hard-encrypted OLE container walls where parsing headers fails immediately
-            catch (CFException ex) when
-                (ex.Message.Contains("encrypted", StringComparison.OrdinalIgnoreCase) ||
-                ex.Message.Contains("password", StringComparison.OrdinalIgnoreCase)
-                )
-            {
-                status.IsPasswordProtected = true;
-                status.Reason = "File is password protected or encrypted.";
-            }
-            // Catch structural format breaks and corrupted sector tables
+            // Catch structural format breaks, corrupted sector tables, or hard-encrypted OLE containers
             catch (CFException)
             {
                 status.IsCorruptedOrInvalid = true;
-                status.Reason = "Invalid file layout (Not a standard .pub binary container or corrupt).";
+                status.Reason = "Invalid file layout or corrupted OLE container.";
             }
             // Catch remaining unexpected operating system file access or hardware reading barriers
             catch (Exception ex)
