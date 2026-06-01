@@ -48,7 +48,6 @@ namespace PublisherConverter.Core
     public interface IPublisherWorkerClient : IDisposable
     {
         Task<WorkerResponse> SendRequestAsync(WorkerRequest request, int? timeoutSeconds, CancellationToken cancellationToken);
-        void EnsureWorkerStarted();
         Task EnsureWorkerStartedAsync(CancellationToken cancellationToken);
         void RecycleWorker();
         bool IsHealthy { get; }
@@ -62,9 +61,19 @@ namespace PublisherConverter.Core
         Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null);
     }
 
+    /// <summary>
+    /// Renders a Publisher document to PDF. Implementations may be COM-based
+    /// (PublisherComRenderer) or stub-based (used by integration tests).
+    /// </summary>
+    public interface IDocumentRenderer : IDisposable
+    {
+        void Initialize();
+        RenderResult Render(RenderJob job);
+    }
+
     public interface IProcessLauncher
     {
-        IProcessHandle StartWorker();
+        IProcessHandle StartWorker(string pipeName);
     }
 
     public interface IProcessHandle : IDisposable

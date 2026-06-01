@@ -1,7 +1,5 @@
 using System;
 using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using PublisherConverter.Core;
 
 namespace PublisherConverter.GUI
@@ -30,7 +28,8 @@ namespace PublisherConverter.GUI
                 return;
             }
 
-            var host = new PublisherWorkerHost(pipeName);
+            using var renderer = new PublisherComRenderer();
+            var host = new PublisherWorkerHost(pipeName, renderer);
             host.Run();
         }
 
@@ -42,7 +41,7 @@ namespace PublisherConverter.GUI
 
         private static string ParseArgument(string[] args, string name)
         {
-            string arg = args.FirstOrDefault(a => a.StartsWith(name + "="));
+            string? arg = args.FirstOrDefault(a => a.StartsWith(name + "="));
             if (arg != null)
             {
                 return arg.Substring(name.Length + 1);

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -9,235 +11,365 @@ using PublisherConverter.Core;
 namespace PublisherConverter.Tests
 {
     /// <summary>
-    /// Integration tests for actual worker process lifecycle.
-    /// These tests use real process launching and IPC (named pipes).
-    /// They are gated to Windows only because they require Windows-specific APIs.
+    /// Cross-process integration tests for PublisherWorkerClient and
+    /// PublisherLifecycleManager. These tests launch the real
+    /// PublisherConverter.TestWorker executable (a small console host that
+    /// wraps PublisherWorkerHost with a stub renderer), exercising the
+    /// actual ProcessLauncher, ProcessHandle, NamedPipeWorkerTransport and
+    /// lifecycle code paths without requiring COM or Microsoft Publisher.
     /// </summary>
     [Trait("Category", "Integration")]
-    [Trait("Platform", "Windows")]
     public class WorkerIntegrationTests : IDisposable
     {
-        private readonly string _testWorkspaceDir;
+        // Short timeouts so that the failure paths exercised by these tests
+        // (worker hang, worker crash, missing executable) wrap up in seconds
+        // instead of the 30-second production default.
+        private const int ConnectionTimeoutMs = 3000;
+        private const int DefaultRequestTimeoutSeconds = 3;
+
+        private readonly string _workspaceDir;
+        private readonly List<PublisherWorkerClient> _clients = new();
 
         public WorkerIntegrationTests()
         {
-            // Skip on non-Windows platforms
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                throw new SkipTestException("Worker integration tests require Windows");
-            }
-
-            _testWorkspaceDir = Path.Combine(Path.GetTempPath(), $"WorkerInt_{Guid.NewGuid():N}");
-            Directory.CreateDirectory(_testWorkspaceDir);
+            _workspaceDir = Path.Combine(Path.GetTempPath(), $"WorkerInt_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(_workspaceDir);
         }
 
-        [Fact(Skip = "Requires GUI executable path to be provided; use ProcessLauncher(pipeName, guiExePath) in production")]
-        public async Task WorkerClient_ShouldConnectToWorkerProcessAsync()
+        private PublisherWorkerClient CreateClient(string? scenario = null, int? defaultTimeoutSeconds = null)
         {
-            // The worker mode IS implemented in Program.cs and PublisherWorkerHost handles it correctly.
-            // However, this test tries to spawn the test runner as a worker, which won't work.
-            // In production, use PublisherLifecycleManager.CreateWithWorkerPath(guiExecutablePath)
-            // to specify the GUI executable to launch as a worker process.
+            string workerExe = TestWorkerLocator.GetExecutable();
+            string? extraArgs = scenario != null ? $"--scenario={scenario}" : null;
 
-            // Arrange
-            string pipeName = $"TestPipe_{Guid.NewGuid():N}";
-            var launcher = new ProcessLauncher(pipeName);
-            var transportFactory = () => new NamedPipeWorkerTransport(pipeName);
+            var launcher = new ProcessLauncher(workerExe, extraArgs);
+            Func<string, IWorkerTransport> transportFactory = pipe => new NamedPipeWorkerTransport(pipe);
             var healthMonitor = new DefaultWorkerHealthMonitor();
-            var timeoutProvider = new DefaultTimeoutProvider(60);
+            var timeoutProvider = new DefaultTimeoutProvider(defaultTimeoutSeconds ?? DefaultRequestTimeoutSeconds);
 
-            var client = new PublisherWorkerClient(launcher, transportFactory, healthMonitor, timeoutProvider);
-
-            // Act & Assert
-            // This will start the worker process and establish IPC connection
-            await client.EnsureWorkerStartedAsync(CancellationToken.None);
-
-            // Verify process is running
-            Assert.True(client.IsHealthy);
-
-            // Cleanup
-            client.Dispose();
+            var client = new PublisherWorkerClient(
+                launcher,
+                transportFactory,
+                healthMonitor,
+                timeoutProvider,
+                connectionTimeoutMs: ConnectionTimeoutMs);
+            _clients.Add(client);
+            return client;
         }
 
         [Fact]
-        public async Task WorkerClient_ShouldHandleConnectionTimeoutAsync()
+        public async Task SpawnsRealWorkerAndConnects()
         {
-            // Arrange - Uses FakeProcessLauncher, not a real process
-            string pipeName = $"DeadPipe_{Guid.NewGuid():N}";
-            var launcher = new FakeProcessLauncher(); // Won't actually start a process
-            var transportFactory = () => new NamedPipeWorkerTransport(pipeName);
-            var healthMonitor = new DefaultWorkerHealthMonitor();
-            var timeoutProvider = new DefaultTimeoutProvider(60);
+            var client = CreateClient();
 
-            var client = new PublisherWorkerClient(launcher, transportFactory, healthMonitor, timeoutProvider);
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
 
-            // Act & Assert - should throw InvalidOperationException
-            try
-            {
-                await client.EnsureWorkerStartedAsync(CancellationToken.None);
-                Assert.Fail("Expected InvalidOperationException");
-            }
-            catch (InvalidOperationException ex)
-            {
-                Assert.Contains("Failed to connect", ex.Message);
-            }
+            Assert.True(client.IsHealthy);
         }
 
-        [Fact(Skip = "Requires GUI executable path to be provided; use ProcessLauncher(pipeName, guiExePath) in production")]
-        public async Task WorkerClient_ShouldRecoverFromProcessCrashAsync()
+        [Fact]
+        public async Task HealthCheckRoundTripsThroughRealWorker()
         {
-            // The worker mode IS implemented. Use PublisherLifecycleManager.CreateWithWorkerPath(guiExecutablePath)
-            // to properly test process crash recovery in production.
+            var client = CreateClient();
 
-            // Arrange
-            string pipeName = $"CrashPipe_{Guid.NewGuid():N}";
-            var launcher = new ProcessLauncher(pipeName);
-            var transportFactory = () => new NamedPipeWorkerTransport(pipeName);
-            var healthMonitor = new DefaultWorkerHealthMonitor();
-            var timeoutProvider = new DefaultTimeoutProvider(60);
+            var response = await client.SendRequestAsync(
+                new WorkerRequest { Command = "health" },
+                timeoutSeconds: DefaultRequestTimeoutSeconds,
+                CancellationToken.None);
 
-            var client = new PublisherWorkerClient(launcher, transportFactory, healthMonitor, timeoutProvider);
+            Assert.True(response.Success);
+        }
 
-            // Act - Start worker
+        [Fact]
+        public async Task RenderJobProducesPdfViaRealWorker()
+        {
+            var client = CreateClient();
+
+            string sourcePath = Path.Combine(_workspaceDir, "source.pub");
+            File.WriteAllText(sourcePath, "fake publisher content");
+            string targetPath = Path.Combine(_workspaceDir, "output.pdf");
+
+            var response = await client.SendRequestAsync(new WorkerRequest
+            {
+                Command = "render",
+                RenderJob = new RenderJob
+                {
+                    SourcePubPath = sourcePath,
+                    TargetPdfPath = targetPath,
+                    RunLinkCheck = false
+                }
+            }, timeoutSeconds: DefaultRequestTimeoutSeconds, CancellationToken.None);
+
+            Assert.True(response.Success, response.ErrorMessage);
+            Assert.NotNull(response.RenderResult);
+            Assert.True(File.Exists(targetPath));
+
+            string contents = File.ReadAllText(targetPath);
+            Assert.StartsWith("%PDF-", contents);
+        }
+
+        [Fact]
+        public async Task MultipleSequentialRequestsReuseSameWorkerProcess()
+        {
+            var client = CreateClient();
+
+            for (int i = 0; i < 5; i++)
+            {
+                var response = await client.SendRequestAsync(
+                    new WorkerRequest { Command = "health" },
+                    timeoutSeconds: 10,
+                    CancellationToken.None);
+                Assert.True(response.Success);
+            }
+
+            // Worker should still be alive; we can verify by sending a final
+            // request and checking IsHealthy.
+            Assert.True(client.IsHealthy);
+        }
+
+        [Fact]
+        public async Task RecycleTerminatesWorkerThenNextRequestSpawnsNewOne()
+        {
+            var client = CreateClient();
+
             await client.EnsureWorkerStartedAsync(CancellationToken.None);
             Assert.True(client.IsHealthy);
 
-            // Simulate process exit by killing it
             client.RecycleWorker();
-            await Task.Delay(500); // Give process time to exit
 
-            // Client should detect unhealthy state
+            // Wait briefly for the killed process to actually exit so the next
+            // bind to the same pipe name can succeed.
+            await WaitUntilUnhealthyAsync(client, TimeSpan.FromSeconds(3));
             Assert.False(client.IsHealthy);
 
-            // Should recover on next request
+            var response = await client.SendRequestAsync(
+                new WorkerRequest { Command = "health" },
+                timeoutSeconds: DefaultRequestTimeoutSeconds,
+                CancellationToken.None);
+
+            Assert.True(response.Success);
+            Assert.True(client.IsHealthy);
+        }
+
+        [Fact]
+        public async Task GracefulShutdownEndsWorkerProcess()
+        {
+            var client = CreateClient();
+
             await client.EnsureWorkerStartedAsync(CancellationToken.None);
             Assert.True(client.IsHealthy);
 
-            // Cleanup
-            client.Dispose();
+            var response = await client.SendRequestAsync(
+                new WorkerRequest { Command = "shutdown" },
+                timeoutSeconds: DefaultRequestTimeoutSeconds,
+                CancellationToken.None);
+
+            Assert.True(response.Success);
+
+            // Worker process exits after acknowledging shutdown.
+            await WaitUntilUnhealthyAsync(client, TimeSpan.FromSeconds(3));
+            Assert.False(client.IsHealthy);
         }
 
-        [Fact(Skip = "Requires GUI executable path to be provided; use ProcessLauncher(pipeName, guiExePath) in production")]
-        public async Task LifecycleManager_ShouldInitializeWithHealthCheckAsync()
+        [Fact]
+        public async Task RenderFailureFromWorkerSurfacesAsErrorResponse()
         {
-            // The worker mode IS implemented. Use PublisherLifecycleManager.CreateWithWorkerPath(guiExecutablePath)
-            // to properly initialize with health checks in production.
+            var client = CreateClient(scenario: "fail-render");
 
-            // Arrange
-            string pipeName = $"HealthPipe_{Guid.NewGuid():N}";
-            var launcher = new ProcessLauncher(pipeName);
-            var transportFactory = () => new NamedPipeWorkerTransport(pipeName);
-            var healthMonitor = new DefaultWorkerHealthMonitor();
-            var timeoutProvider = new DefaultTimeoutProvider(60);
+            var response = await client.SendRequestAsync(new WorkerRequest
+            {
+                Command = "render",
+                RenderJob = new RenderJob
+                {
+                    SourcePubPath = Path.Combine(_workspaceDir, "x.pub"),
+                    TargetPdfPath = Path.Combine(_workspaceDir, "x.pdf"),
+                }
+            }, timeoutSeconds: DefaultRequestTimeoutSeconds, CancellationToken.None);
 
-            var workerClient = new PublisherWorkerClient(launcher, transportFactory, healthMonitor, timeoutProvider);
-            var manager = new PublisherLifecycleManager(workerClient, maxConsecutiveFailures: 3);
+            Assert.False(response.Success);
+            Assert.Contains("Simulated render failure", response.ErrorMessage);
 
-            // Act & Assert
-            // This should successfully connect to worker and perform health check
+            // Worker stays alive after a per-job error and can still serve other commands.
+            var healthResponse = await client.SendRequestAsync(
+                new WorkerRequest { Command = "health" },
+                timeoutSeconds: DefaultRequestTimeoutSeconds,
+                CancellationToken.None);
+            Assert.True(healthResponse.Success);
+        }
+
+        [Fact]
+        public async Task HangingRenderTriggersTimeoutAndKillsWorker()
+        {
+            var client = CreateClient(scenario: "hang-render", defaultTimeoutSeconds: 1);
+
+            var ex = await Assert.ThrowsAsync<TimeoutException>(() =>
+                client.SendRequestAsync(new WorkerRequest
+                {
+                    Command = "render",
+                    RenderJob = new RenderJob
+                    {
+                        SourcePubPath = Path.Combine(_workspaceDir, "x.pub"),
+                        TargetPdfPath = Path.Combine(_workspaceDir, "x.pdf"),
+                    }
+                }, timeoutSeconds: 1, CancellationToken.None));
+
+            Assert.Contains("timed out", ex.Message);
+
+            await WaitUntilUnhealthyAsync(client, TimeSpan.FromSeconds(3));
+            Assert.False(client.IsHealthy);
+        }
+
+        [Fact]
+        public async Task WorkerCrashMidJobSurfacesAsException()
+        {
+            var client = CreateClient(scenario: "crash-on-render");
+
+            // The worker dies mid-render; the client surfaces this as a pipe-broken
+            // / EndOfStream exception rather than a logical error response.
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                client.SendRequestAsync(new WorkerRequest
+                {
+                    Command = "render",
+                    RenderJob = new RenderJob
+                    {
+                        SourcePubPath = Path.Combine(_workspaceDir, "x.pub"),
+                        TargetPdfPath = Path.Combine(_workspaceDir, "x.pdf"),
+                    }
+                }, timeoutSeconds: DefaultRequestTimeoutSeconds, CancellationToken.None));
+
+            await WaitUntilUnhealthyAsync(client, TimeSpan.FromSeconds(3));
+            Assert.False(client.IsHealthy);
+        }
+
+        [Fact]
+        public async Task LifecycleManagerInitializeAgainstRealWorker()
+        {
+            var client = CreateClient();
+            var manager = new PublisherLifecycleManager(client);
+
             await manager.InitializeAsync(CancellationToken.None);
 
-            // No exception thrown indicates success
+            Assert.True(client.IsHealthy);
 
-            // Cleanup
+            // Shutdown should release the worker without throwing.
+            manager.Shutdown();
+
+            await WaitUntilUnhealthyAsync(client, TimeSpan.FromSeconds(3));
+            Assert.False(client.IsHealthy);
+        }
+
+        [Fact]
+        public async Task LifecycleManagerExecuteRenderingJobPropagatesResult()
+        {
+            var client = CreateClient();
+            var manager = new PublisherLifecycleManager(client);
+
+            await manager.InitializeAsync(CancellationToken.None);
+
+            string sourcePath = Path.Combine(_workspaceDir, "lm.pub");
+            File.WriteAllText(sourcePath, "fake");
+            string targetPath = Path.Combine(_workspaceDir, "lm.pdf");
+
+            var record = new FileRecord { FileName = "lm.pub" };
+            await manager.ExecuteRenderingJobAsync(record, sourcePath, targetPath, runLinkCheck: false, timeoutSeconds: DefaultRequestTimeoutSeconds, CancellationToken.None);
+
+            Assert.True(File.Exists(targetPath));
+            Assert.Equal(0, record.MissingAssetsCount);
+
             manager.Shutdown();
         }
 
         [Fact]
-        public void LifecycleManager_ShouldDetectConsecutiveFailures()
+        public async Task ConnectingToNonexistentWorkerExecutableFailsFast()
         {
-            // Arrange
-            var renderer = new FakePublisherRenderer();
-            renderer.MaxConsecutiveFailures = 2;
+            string bogusPath = Path.Combine(_workspaceDir, "does-not-exist.exe");
+            var launcher = new ProcessLauncher(bogusPath);
 
-            // Act
-            Assert.False(renderer.RecordBatchFailure()); // Count: 1
-            Assert.True(renderer.RecordBatchFailure());  // Count: 2, should return true
+            var client = new PublisherWorkerClient(
+                launcher,
+                pipe => new NamedPipeWorkerTransport(pipe),
+                new DefaultWorkerHealthMonitor(),
+                new DefaultTimeoutProvider(DefaultRequestTimeoutSeconds),
+                connectionTimeoutMs: ConnectionTimeoutMs);
+            _clients.Add(client);
 
-            renderer.RecordBatchSuccess();
-            Assert.False(renderer.RecordBatchFailure()); // Count: 1 (reset)
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                client.EnsureWorkerStartedAsync(CancellationToken.None));
         }
 
-        [Fact(Skip = "Requires GUI executable path to be provided; use ProcessLauncher(pipeName, guiExePath) in production")]
-        [PlatformSpecific("Windows")]
-        public async Task WorkerHost_ShouldReceiveAndRespondToRequestsAsync()
+        private static async Task WaitUntilUnhealthyAsync(IPublisherWorkerClient client, TimeSpan timeout)
         {
-            // The worker mode IS implemented. Use PublisherLifecycleManager.CreateWithWorkerPath(guiExecutablePath)
-            // to properly test IPC communication in production.
-
-            // Arrange
-            string pipeName = $"RequestPipe_{Guid.NewGuid():N}";
-            
-            // Start a minimal worker in the background
-            var workerTask = Task.Run(() =>
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
             {
-                var transport = new NamedPipeWorkerTransport(pipeName, isServer: true);
-                try
-                {
-                    // Simulate simplified worker message loop
-                    transport.Connect();
-                    
-                    // Receive health check request
-                    var request = ((NamedPipeWorkerTransport)(object)transport).ReceiveRequestSync();
-                    
-                    if (request?.Command == "health")
-                    {
-                        transport.SendResponseSync(new WorkerResponse { Success = true });
-                    }
-                }
-                catch { }
-                finally
-                {
-                    transport.Dispose();
-                }
-            }, CancellationToken.None);
-
-            // Act - Connect and send health check
-            var clientTransport = new NamedPipeWorkerTransport(pipeName, isServer: false);
-            await clientTransport.ConnectAsync(CancellationToken.None, timeoutMs: 5000);
-            
-            await clientTransport.SendRequestAsync(
-                new WorkerRequest { Command = "health" },
-                CancellationToken.None);
-            
-            var response = await clientTransport.ReceiveResponseAsync(CancellationToken.None);
-
-            // Assert
-            Assert.NotNull(response);
-            Assert.True(response.Success);
-
-            // Cleanup
-            clientTransport.Dispose();
-            await Task.WhenAny(workerTask, Task.Delay(5000));
+                if (!client.IsHealthy) return;
+                await Task.Delay(50);
+            }
         }
 
         public void Dispose()
         {
-            if (Directory.Exists(_testWorkspaceDir))
+            foreach (var client in _clients)
             {
-                try
-                {
-                    Directory.Delete(_testWorkspaceDir, true);
-                }
-                catch { }
+                try { client.Dispose(); } catch { }
+            }
+
+            if (Directory.Exists(_workspaceDir))
+            {
+                try { Directory.Delete(_workspaceDir, true); } catch { }
             }
         }
     }
 
     /// <summary>
-    /// Helper attribute to mark tests that require a specific platform.
+    /// Locates the compiled PublisherConverter.TestWorker executable so
+    /// integration tests can spawn it as a child process. Resolves the path
+    /// relative to the test assembly's bin directory by walking up to the
+    /// solution root, then reusing the same Configuration/TargetFramework
+    /// the test runner was built against.
     /// </summary>
-    [AttributeUsage(AttributeTargets.Method)]
-    internal class PlatformSpecificAttribute : Attribute
+    internal static class TestWorkerLocator
     {
-        public PlatformSpecificAttribute(string platform) { }
-    }
+        private const string ProjectName = "PublisherConverter.TestWorker";
 
-    /// <summary>
-    /// Exception to skip a test.
-    /// </summary>
-    internal class SkipTestException : Exception
-    {
-        public SkipTestException(string message) : base(message) { }
+        public static string GetExecutable()
+        {
+            string testBin = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            string? solutionDir = FindSolutionRoot(testBin);
+            if (solutionDir == null)
+            {
+                throw new InvalidOperationException(
+                    $"Could not locate the solution root walking up from '{testBin}'.");
+            }
+
+            var testBinInfo = new DirectoryInfo(testBin);
+            string framework = testBinInfo.Name;
+            string config = testBinInfo.Parent?.Name ?? "Debug";
+
+            string exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? $"{ProjectName}.exe"
+                : ProjectName;
+
+            string candidate = Path.Combine(solutionDir, ProjectName, "bin", config, framework, exeName);
+            if (!File.Exists(candidate))
+            {
+                throw new FileNotFoundException(
+                    $"Test worker executable not found at '{candidate}'. " +
+                    $"Make sure '{ProjectName}' is built (it is referenced as a build-only dependency of the test project).");
+            }
+
+            return candidate;
+        }
+
+        private static string? FindSolutionRoot(string startDir)
+        {
+            DirectoryInfo? dir = new DirectoryInfo(startDir);
+            while (dir != null)
+            {
+                if (dir.GetFiles("*.sln").Any()) return dir.FullName;
+                dir = dir.Parent;
+            }
+            return null;
+        }
     }
 }

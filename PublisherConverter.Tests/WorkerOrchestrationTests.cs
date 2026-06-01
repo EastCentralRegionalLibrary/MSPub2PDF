@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -9,242 +8,328 @@ using PublisherConverter.Core;
 namespace PublisherConverter.Tests
 {
     /// <summary>
-    /// Unit tests for worker orchestration behavior.
-    /// These tests use mocks/fakes to isolate and verify orchestration logic
-    /// without requiring actual Publisher COM or process launching.
+    /// Unit tests that exercise the orchestration logic in PublisherWorkerClient
+    /// and PublisherLifecycleManager using in-process fakes for the transport,
+    /// process launcher, and health monitor. These tests stay fast and
+    /// deterministic; the cross-process behavior is exercised by
+    /// WorkerIntegrationTests.
     /// </summary>
     public class WorkerOrchestrationTests
     {
+        // -----------------------------
+        // PublisherWorkerClient
+        // -----------------------------
+
         [Fact]
-        public async Task PublisherWorkerClient_ShouldEnsureWorkerStartedAsyncExactlyOnce()
+        public async Task WorkerClient_StartsWorkerLazilyOnFirstRequest()
         {
-            // Arrange
             var launcher = new FakeProcessLauncher();
-            var fakeTransport = new FakeWorkerTransport();
-            var healthMonitor = new FakeWorkerHealthMonitor { IsHealthy = true };
-            var timeoutProvider = new FakeTimeoutProvider();
+            var transport = new FakeWorkerTransport();
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => transport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
 
-            var client = new PublisherWorkerClient(launcher, () => fakeTransport, healthMonitor, timeoutProvider);
+            Assert.Empty(launcher.CreatedProcesses);
 
-            // Act - Call multiple times
-            await client.EnsureWorkerStartedAsync(CancellationToken.None);
-            await client.EnsureWorkerStartedAsync(CancellationToken.None);
-            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+            var response = await client.SendRequestAsync(
+                new WorkerRequest { Command = "render" },
+                timeoutSeconds: 10,
+                CancellationToken.None);
 
-            // Assert - Process should only be started once
+            Assert.True(response.Success);
             Assert.Single(launcher.CreatedProcesses);
-            Assert.True(fakeTransport.Connected);
+            Assert.True(transport.Connected);
+            Assert.Single(transport.SentRequests);
+            Assert.Equal("render", transport.SentRequests[0].Command);
         }
 
         [Fact]
-        public async Task PublisherWorkerClient_ShouldRecycleWorkerAndRestart()
+        public async Task WorkerClient_DoesNotRestartHealthyWorker()
         {
-            // Arrange
+            var launcher = new FakeProcessLauncher();
+            var transport = new FakeWorkerTransport();
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => transport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
+
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+
+            Assert.Single(launcher.CreatedProcesses);
+        }
+
+        [Fact]
+        public async Task WorkerClient_RecycleKillsOldProcessAndNextRequestStartsNew()
+        {
             var launcher = new FakeProcessLauncher();
             var transports = new Queue<FakeWorkerTransport>();
             transports.Enqueue(new FakeWorkerTransport());
             transports.Enqueue(new FakeWorkerTransport());
 
-            var healthMonitor = new FakeWorkerHealthMonitor { IsHealthy = true };
-            var timeoutProvider = new FakeTimeoutProvider();
-
             var client = new PublisherWorkerClient(
                 launcher,
-                () => transports.Dequeue(),
-                healthMonitor,
-                timeoutProvider);
+                _ => transports.Dequeue(),
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
 
-            // Act
             await client.EnsureWorkerStartedAsync(CancellationToken.None);
             Assert.Single(launcher.CreatedProcesses);
 
             client.RecycleWorker();
+            Assert.True(launcher.CreatedProcesses[0].Killed);
 
             await client.EnsureWorkerStartedAsync(CancellationToken.None);
-
-            // Assert - New process should be started
             Assert.Equal(2, launcher.CreatedProcesses.Count);
-            Assert.True(launcher.CreatedProcesses[0].Killed);
             Assert.False(launcher.CreatedProcesses[1].Killed);
         }
 
         [Fact]
-        public async Task PublisherWorkerClient_ShouldSendRequestAndReceiveResponse()
+        public async Task WorkerClient_TimeoutKillsWorkerAndThrowsTimeoutException()
         {
-            // Arrange
             var launcher = new FakeProcessLauncher();
-            var fakeTransport = new FakeWorkerTransport();
-            fakeTransport.Responses.Enqueue(new WorkerResponse { Success = true });
+            var hangingTransport = new HangingWorkerTransport();
+            var timeoutProvider = new FakeTimeoutProvider { Timeout = TimeSpan.FromMilliseconds(20) };
 
-            var healthMonitor = new FakeWorkerHealthMonitor { IsHealthy = true };
-            var timeoutProvider = new FakeTimeoutProvider();
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => hangingTransport,
+                new FakeWorkerHealthMonitor(),
+                timeoutProvider);
 
-            var client = new PublisherWorkerClient(launcher, () => fakeTransport, healthMonitor, timeoutProvider);
-
-            var request = new WorkerRequest { Command = "render", RenderJob = new RenderJob() };
-
-            // Act
-            var response = await client.SendRequestAsync(request, timeoutSeconds: 10, CancellationToken.None);
-
-            // Assert
-            Assert.NotNull(response);
-            Assert.True(response.Success);
-            Assert.Single(fakeTransport.SentRequests);
-            Assert.Equal("render", fakeTransport.SentRequests[0].Command);
-        }
-
-        [Fact]
-        public async Task PublisherWorkerClient_ShouldRecycleOnTimeout()
-        {
-            // Arrange
-            var launcher = new FakeProcessLauncher();
-            var slowTransport = new SlowWorkerTransport();
-            
-            var healthMonitor = new FakeWorkerHealthMonitor { IsHealthy = true };
-            var timeoutProvider = new FakeTimeoutProvider { Timeout = TimeSpan.FromMilliseconds(10) };
-
-            var client = new PublisherWorkerClient(launcher, () => slowTransport, healthMonitor, timeoutProvider);
-
-            var request = new WorkerRequest { Command = "render" };
-
-            // Act & Assert - Should timeout and throw
-            var ex = await Assert.ThrowsAsync<TimeoutException>(
-                () => client.SendRequestAsync(request, timeoutSeconds: null, CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<TimeoutException>(() =>
+                client.SendRequestAsync(new WorkerRequest { Command = "render" }, timeoutSeconds: null, CancellationToken.None));
 
             Assert.Contains("timed out", ex.Message);
+            Assert.Single(launcher.CreatedProcesses);
             Assert.True(launcher.CreatedProcesses[0].Killed);
         }
 
         [Fact]
-        public async Task PublisherWorkerClient_ShouldRecycleOnException()
+        public async Task WorkerClient_TransportExceptionKillsWorkerAndRethrows()
         {
-            // Arrange
             var launcher = new FakeProcessLauncher();
-            var fakeTransport = new FailingWorkerTransport();
-            
-            var healthMonitor = new FakeWorkerHealthMonitor { IsHealthy = true };
-            var timeoutProvider = new FakeTimeoutProvider();
+            var failingTransport = new FailingWorkerTransport();
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => failingTransport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
 
-            var client = new PublisherWorkerClient(launcher, () => fakeTransport, healthMonitor, timeoutProvider);
-
-            var request = new WorkerRequest { Command = "render" };
-
-            // Act & Assert - Should throw and recycle
-            await Assert.ThrowsAsync<InvalidOperationException>(
-                () => client.SendRequestAsync(request, timeoutSeconds: 10, CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                client.SendRequestAsync(new WorkerRequest { Command = "render" }, timeoutSeconds: 10, CancellationToken.None));
 
             Assert.True(launcher.CreatedProcesses[0].Killed);
         }
 
         [Fact]
-        public void PublisherLifecycleManager_ShouldTrackConsecutiveFailures()
+        public async Task WorkerClient_LogicalFailureDoesNotRecycleWorker()
         {
-            // Arrange
-            var workerClient = new FakePublisherWorkerClient();
-            var manager = new PublisherLifecycleManager(workerClient, maxConsecutiveFailures: 3);
+            var launcher = new FakeProcessLauncher();
+            var transport = new FakeWorkerTransport();
+            transport.Responses.Enqueue(new WorkerResponse { Success = false, ErrorMessage = "render failed" });
 
-            // Act
-            Assert.False(manager.RecordBatchFailure()); // Count: 1
-            Assert.False(manager.RecordBatchFailure()); // Count: 2
-            Assert.True(manager.RecordBatchFailure());  // Count: 3, should return true
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => transport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
 
-            // Assert
+            var response = await client.SendRequestAsync(
+                new WorkerRequest { Command = "render" },
+                timeoutSeconds: 10,
+                CancellationToken.None);
+
+            Assert.False(response.Success);
+            Assert.False(launcher.CreatedProcesses[0].Killed);
+        }
+
+        [Fact]
+        public async Task WorkerClient_AfterDisposeRejectsNewRequests()
+        {
+            var launcher = new FakeProcessLauncher();
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => new FakeWorkerTransport(),
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
+
+            client.Dispose();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+                client.SendRequestAsync(new WorkerRequest { Command = "health" }, timeoutSeconds: 1, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task WorkerClient_ConcurrentStartsLaunchOnlyOneProcess()
+        {
+            var launcher = new FakeProcessLauncher();
+            var transport = new FakeWorkerTransport();
+
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => transport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
+
+            var tasks = new Task[4];
+            for (int i = 0; i < tasks.Length; i++)
+            {
+                tasks[i] = client.EnsureWorkerStartedAsync(CancellationToken.None);
+            }
+            await Task.WhenAll(tasks);
+
+            Assert.Single(launcher.CreatedProcesses);
+        }
+
+        // -----------------------------
+        // PublisherLifecycleManager
+        // -----------------------------
+
+        [Fact]
+        public void LifecycleManager_TracksConsecutiveFailures()
+        {
+            var manager = new PublisherLifecycleManager(new FakePublisherWorkerClient(), maxConsecutiveFailures: 3);
+
+            Assert.False(manager.RecordBatchFailure());
+            Assert.False(manager.RecordBatchFailure());
+            Assert.True(manager.RecordBatchFailure());
             Assert.Equal(3, manager.ConsecutiveFailures);
         }
 
         [Fact]
-        public void PublisherLifecycleManager_ShouldResetConsecutiveFailuresOnSuccess()
+        public void LifecycleManager_SuccessResetsFailureCount()
         {
-            // Arrange
-            var workerClient = new FakePublisherWorkerClient();
-            var manager = new PublisherLifecycleManager(workerClient, maxConsecutiveFailures: 3);
+            var manager = new PublisherLifecycleManager(new FakePublisherWorkerClient(), maxConsecutiveFailures: 3);
 
-            // Act
             manager.RecordBatchFailure();
             manager.RecordBatchFailure();
             manager.RecordBatchSuccess();
 
-            // Assert
             Assert.Equal(0, manager.ConsecutiveFailures);
-            Assert.False(manager.RecordBatchFailure()); // Count: 1 again
+            Assert.False(manager.RecordBatchFailure());
         }
 
         [Fact]
-        public void PublisherLifecycleManager_ShouldRecycleWorkerOnRequest()
+        public void LifecycleManager_RecycleDelegatesToClient()
         {
-            // Arrange
-            var workerClient = new FakePublisherWorkerClient();
-            var manager = new PublisherLifecycleManager(workerClient, maxConsecutiveFailures: 3);
+            var client = new FakePublisherWorkerClient();
+            var manager = new PublisherLifecycleManager(client);
 
-            // Act
             manager.Recycle();
 
-            // Assert
-            Assert.True(workerClient.RecycleWorkerCalled);
+            Assert.True(client.RecycleCalled);
         }
 
         [Fact]
-        public async Task PublisherLifecycleManager_ShouldExecuteRenderingJob()
+        public async Task LifecycleManager_InitializeSendsHealthCheck()
         {
-            // Arrange
-            var workerClient = new FakePublisherWorkerClient();
-            workerClient.SendRequestResponse = new WorkerResponse
-            {
-                Success = true,
-                RenderResult = new RenderResult { MissingAssetsCount = 0 }
-            };
+            var client = new FakePublisherWorkerClient();
+            var manager = new PublisherLifecycleManager(client);
 
-            var manager = new PublisherLifecycleManager(workerClient, maxConsecutiveFailures: 3);
+            await manager.InitializeAsync(CancellationToken.None);
 
-            var record = new FileRecord { FileName = "test.pub" };
-            var sourcePath = "/tmp/test.pub";
-            var targetPath = "/tmp/test.pdf";
-
-            // Act
-            await manager.ExecuteRenderingJobAsync(
-                record,
-                sourcePath,
-                targetPath,
-                runLinkCheck: false,
-                timeoutSeconds: 60,
-                CancellationToken.None);
-
-            // Assert
-            Assert.Equal(0, record.MissingAssetsCount);
-            Assert.Equal("render", workerClient.LastSentRequest?.Command);
+            Assert.True(client.EnsureStartedCalled);
+            Assert.NotNull(client.LastRequest);
+            Assert.Equal("health", client.LastRequest!.Command);
         }
 
         [Fact]
-        public async Task PublisherLifecycleManager_ShouldThrowOnRenderingFailure()
+        public async Task LifecycleManager_InitializeThrowsWhenHealthCheckFails()
         {
-            // Arrange
-            var workerClient = new FakePublisherWorkerClient();
-            workerClient.SendRequestResponse = new WorkerResponse
+            var client = new FakePublisherWorkerClient
             {
-                Success = false,
-                ErrorMessage = "Rendering failed"
+                NextResponse = new WorkerResponse { Success = false, ErrorMessage = "boom" }
             };
+            var manager = new PublisherLifecycleManager(client);
 
-            var manager = new PublisherLifecycleManager(workerClient, maxConsecutiveFailures: 3);
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                manager.InitializeAsync(CancellationToken.None));
+
+            Assert.Contains("Worker initialization failed", ex.Message);
+            Assert.Contains("boom", ex.Message);
+        }
+
+        [Fact]
+        public async Task LifecycleManager_RenderingFailureSurfacesErrorMessage()
+        {
+            var client = new FakePublisherWorkerClient
+            {
+                NextResponse = new WorkerResponse { Success = false, ErrorMessage = "Rendering failed" }
+            };
+            var manager = new PublisherLifecycleManager(client);
 
             var record = new FileRecord { FileName = "test.pub" };
 
-            // Act & Assert
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => manager.ExecuteRenderingJobAsync(
-                    record,
-                    "/tmp/test.pub",
-                    "/tmp/test.pdf",
-                    runLinkCheck: false,
-                    timeoutSeconds: 60,
-                    CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: false, timeoutSeconds: 60, CancellationToken.None));
 
             Assert.Contains("Rendering failed", ex.Message);
         }
 
-        /// <summary>
-        /// Fake worker transport that simulates connection failures.
-        /// </summary>
+        [Fact]
+        public async Task LifecycleManager_RenderingSuccessCopiesMissingAssetsToRecord()
+        {
+            var client = new FakePublisherWorkerClient
+            {
+                NextResponse = new WorkerResponse
+                {
+                    Success = true,
+                    RenderResult = new RenderResult { MissingAssetsCount = 2, MissingAssetsList = "a | b" }
+                }
+            };
+            var manager = new PublisherLifecycleManager(client);
+
+            var record = new FileRecord { FileName = "test.pub" };
+            await manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: true, timeoutSeconds: 60, CancellationToken.None);
+
+            Assert.Equal(2, record.MissingAssetsCount);
+            Assert.Equal("a | b", record.MissingAssetsList);
+            Assert.Equal("render", client.LastRequest?.Command);
+            Assert.True(client.LastRequest?.RenderJob?.RunLinkCheck);
+        }
+
+        [Fact]
+        public void LifecycleManager_ShutdownDisposesWorkerClient()
+        {
+            var client = new FakePublisherWorkerClient();
+            var manager = new PublisherLifecycleManager(client);
+
+            manager.Shutdown();
+
+            Assert.True(client.Disposed);
+            Assert.Equal("shutdown", client.LastRequest?.Command);
+        }
+
+        [Fact]
+        public void LifecycleManager_ShutdownSwallowsClientExceptions()
+        {
+            var client = new FakePublisherWorkerClient { ThrowOnSend = true };
+            var manager = new PublisherLifecycleManager(client);
+
+            // Should not throw even though the worker fails the shutdown send.
+            manager.Shutdown();
+
+            Assert.True(client.Disposed);
+        }
+
+        // -----------------------------
+        // Local test doubles
+        // -----------------------------
+
+        private class HangingWorkerTransport : FakeWorkerTransport
+        {
+            public override async Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
+            {
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+                return new WorkerResponse { Success = true };
+            }
+        }
+
         private class FailingWorkerTransport : FakeWorkerTransport
         {
             public override Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
@@ -253,44 +338,33 @@ namespace PublisherConverter.Tests
             }
         }
 
-        /// <summary>
-        /// Fake worker transport that delays response to simulate timeout.
-        /// </summary>
-        private class SlowWorkerTransport : FakeWorkerTransport
-        {
-            public override async Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
-            {
-                await Task.Delay(5000, cancellationToken);
-                return new WorkerResponse { Success = true };
-            }
-        }
-
-        /// <summary>
-        /// Fake worker client for testing PublisherLifecycleManager.
-        /// </summary>
         private class FakePublisherWorkerClient : IPublisherWorkerClient
         {
-            public bool RecycleWorkerCalled { get; set; }
+            public bool RecycleCalled { get; private set; }
+            public bool EnsureStartedCalled { get; private set; }
+            public bool Disposed { get; private set; }
+            public bool ThrowOnSend { get; set; }
+
             public bool IsHealthy { get; set; } = true;
-            public WorkerRequest? LastSentRequest { get; set; }
-            public WorkerResponse SendRequestResponse { get; set; } = new WorkerResponse { Success = true };
+            public WorkerRequest? LastRequest { get; private set; }
+            public WorkerResponse NextResponse { get; set; } = new WorkerResponse { Success = true };
 
             public Task<WorkerResponse> SendRequestAsync(WorkerRequest request, int? timeoutSeconds, CancellationToken cancellationToken)
             {
-                LastSentRequest = request;
-                return Task.FromResult(SendRequestResponse);
+                LastRequest = request;
+                if (ThrowOnSend) throw new InvalidOperationException("Simulated send failure");
+                return Task.FromResult(NextResponse);
             }
-
-            public void EnsureWorkerStarted() { }
 
             public Task EnsureWorkerStartedAsync(CancellationToken cancellationToken)
             {
+                EnsureStartedCalled = true;
                 return Task.CompletedTask;
             }
 
-            public void RecycleWorker() => RecycleWorkerCalled = true;
+            public void RecycleWorker() => RecycleCalled = true;
 
-            public void Dispose() { }
+            public void Dispose() => Disposed = true;
         }
     }
 }

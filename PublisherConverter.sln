@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PublisherConverter.GUI", "P
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PublisherConverter.Tests", "PublisherConverter.Tests\PublisherConverter.Tests.csproj", "{934231FA-5D51-4331-85A3-4C7C16CA4885}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PublisherConverter.TestWorker", "PublisherConverter.TestWorker\PublisherConverter.TestWorker.csproj", "{815F470C-2631-4381-8115-C8C76B7FF54A}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -55,6 +57,18 @@ Global
 		{934231FA-5D51-4331-85A3-4C7C16CA4885}.Release|x64.Build.0 = Release|Any CPU
 		{934231FA-5D51-4331-85A3-4C7C16CA4885}.Release|x86.ActiveCfg = Release|Any CPU
 		{934231FA-5D51-4331-85A3-4C7C16CA4885}.Release|x86.Build.0 = Release|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Debug|x64.Build.0 = Debug|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Debug|x86.Build.0 = Debug|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Release|x64.ActiveCfg = Release|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Release|x64.Build.0 = Release|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Release|x86.ActiveCfg = Release|Any CPU
+		{815F470C-2631-4381-8115-C8C76B7FF54A}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

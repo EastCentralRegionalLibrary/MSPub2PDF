@@ -1,26 +1,27 @@
 using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Office.Interop.Publisher;
 
 namespace PublisherConverter.Core
 {
+    /// <summary>
+    /// Hosts a document renderer behind a named-pipe request loop. The host
+    /// itself is rendering-engine agnostic — callers inject an IDocumentRenderer
+    /// (PublisherComRenderer in production, stub renderer in tests). This keeps
+    /// the process lifecycle behavior independently testable from COM/Publisher.
+    /// </summary>
     public class PublisherWorkerHost
     {
         private readonly string _pipeName;
-        private Application? _pubApp;
+        private readonly IDocumentRenderer _renderer;
 
-        public PublisherWorkerHost(string pipeName)
+        public PublisherWorkerHost(string pipeName, IDocumentRenderer renderer)
         {
+            if (string.IsNullOrEmpty(pipeName)) throw new ArgumentException("Pipe name must be provided.", nameof(pipeName));
             _pipeName = pipeName;
+            _renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
         }
 
         public void Run()
         {
-            // Worker host runs synchronously on the STA thread to maintain thread affinity for COM.
             using var transport = new NamedPipeWorkerTransport(_pipeName, isServer: true);
             try
             {
@@ -32,135 +33,72 @@ namespace PublisherConverter.Core
                 return;
             }
 
+            bool rendererInitialized = false;
             try
             {
-                InitializePublisher();
+                try
+                {
+                    _renderer.Initialize();
+                    rendererInitialized = true;
+                }
+                catch (Exception ex)
+                {
+                    TrySendResponse(transport, new WorkerResponse { Success = false, ErrorMessage = $"Renderer init failed: {ex.Message}" });
+                    return;
+                }
 
                 while (true)
                 {
                     var request = transport.ReceiveRequestSync();
                     if (request == null) break;
 
-                    if (request.Command == "shutdown")
+                    switch (request.Command)
                     {
-                        transport.SendResponseSync(new WorkerResponse { Success = true });
-                        break;
-                    }
+                        case "shutdown":
+                            TrySendResponse(transport, new WorkerResponse { Success = true });
+                            return;
 
-                    if (request.Command == "render" && request.RenderJob != null)
-                    {
-                        var response = ExecuteRender(request.RenderJob);
-                        transport.SendResponseSync(response);
-                    }
-                    else if (request.Command == "health")
-                    {
-                        transport.SendResponseSync(new WorkerResponse { Success = true });
+                        case "health":
+                            TrySendResponse(transport, new WorkerResponse { Success = true });
+                            break;
+
+                        case "render":
+                            TrySendResponse(transport, ExecuteRender(request.RenderJob));
+                            break;
+
+                        default:
+                            TrySendResponse(transport, new WorkerResponse { Success = false, ErrorMessage = $"Unknown command: {request.Command}" });
+                            break;
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                try
-                {
-                    transport.SendResponseSync(new WorkerResponse { Success = false, ErrorMessage = ex.Message });
-                }
-                catch { }
             }
             finally
             {
-                CleanupPublisher();
+                if (rendererInitialized)
+                {
+                    try { _renderer.Dispose(); } catch { }
+                }
             }
         }
 
-        private void InitializePublisher()
+        private WorkerResponse ExecuteRender(RenderJob? job)
         {
-            _pubApp = new Application();
-            _pubApp.AutomationSecurity = Microsoft.Office.Core.MsoAutomationSecurity.msoAutomationSecurityForceDisable;
-        }
+            if (job == null) return new WorkerResponse { Success = false, ErrorMessage = "Missing render job in request." };
 
-        private void CleanupPublisher()
-        {
-            if (_pubApp != null)
-            {
-                try { _pubApp.Quit(); } catch { }
-                try { Marshal.ReleaseComObject(_pubApp); } catch { }
-                _pubApp = null;
-            }
-        }
-
-        private WorkerResponse ExecuteRender(RenderJob job)
-        {
-            if (_pubApp == null) return new WorkerResponse { Success = false, ErrorMessage = "Publisher not initialized." };
-
-            Document? doc = null;
             try
             {
-                doc = _pubApp.Open(Filename: job.SourcePubPath, ReadOnly: true);
-
-                var result = new RenderResult();
-                if (job.RunLinkCheck)
-                {
-                    AuditDocumentLinks(doc, result);
-                }
-
-                doc.ExportAsFixedFormat(
-                    Format: PbFixedFormatType.pbFixedFormatTypePDF,
-                    Filename: job.TargetPdfPath,
-                    Intent: PbFixedFormatIntent.pbIntentCommercial,
-                    IncludeDocumentProperties: true,
-                    DocStructureTags: true,
-                    BitmapMissingFonts: true,
-                    UseISO19005_1: true
-                );
-
+                var result = _renderer.Render(job);
                 return new WorkerResponse { Success = true, RenderResult = result };
             }
             catch (Exception ex)
             {
                 return new WorkerResponse { Success = false, ErrorMessage = ex.Message };
             }
-            finally
-            {
-                if (doc != null)
-                {
-                    try { doc.Close(); } catch { }
-                    try { Marshal.ReleaseComObject(doc); } catch { }
-                }
-            }
         }
 
-        private void AuditDocumentLinks(Document doc, RenderResult result)
+        private static void TrySendResponse(NamedPipeWorkerTransport transport, WorkerResponse response)
         {
-            var brokenAssets = new List<string>();
-            foreach (Page page in doc.Pages)
-            {
-                foreach (Shape shape in page.Shapes)
-                {
-                    try
-                    {
-                        if (shape.PictureFormat != null && shape.PictureFormat.IsLinked == Microsoft.Office.Core.MsoTriState.msoTrue)
-                        {
-                            string fileRef = shape.PictureFormat.Filename;
-                            if (!File.Exists(fileRef)) brokenAssets.Add($"[Page {page.PageNumber}] Image Link: {fileRef}");
-                        }
-                    }
-                    catch { }
-                    try
-                    {
-                        if (shape.LinkFormat != null && !string.IsNullOrEmpty(shape.LinkFormat.SourceFullName))
-                        {
-                            string OleRef = shape.LinkFormat.SourceFullName;
-                            if (!File.Exists(OleRef)) brokenAssets.Add($"[Page {page.PageNumber}] OLE Data Ref: {OleRef}");
-                        }
-                    }
-                    catch { }
-                }
-            }
-            if (brokenAssets.Count > 0)
-            {
-                result.MissingAssetsCount = brokenAssets.Count;
-                result.MissingAssetsList = string.Join(" | ", brokenAssets);
-            }
+            try { transport.SendResponseSync(response); } catch { }
         }
     }
 }
