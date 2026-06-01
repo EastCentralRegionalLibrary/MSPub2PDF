@@ -193,15 +193,20 @@
                   Grid.Row="4"
                   Padding="5"
                   FontWeight="SemiBold">
-            <TextBox x:Name="TxtConsoleLog"
-                     IsReadOnly="True"
-                     TextWrapping="Wrap"
-                     VerticalScrollBarVisibility="Auto"
-                     Background="#1E1E1E"
-                     Foreground="#D4D4D4"
-                     FontFamily="Consolas"
-                     FontSize="12"
-                     FontWeight="Normal"/>
+            <ListBox x:Name="LstConsoleLog"
+                    Background="#1E1E1E"
+                    Foreground="#D4D4D4"
+                    FontFamily="Consolas"
+                    FontSize="12"
+                    ScrollViewer.CanContentScroll="True"
+                    VirtualizingStackPanel.IsVirtualizing="True"
+                    VirtualizingStackPanel.VirtualizationMode="Recycling">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding}" TextWrapping="NoWrap"/>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
         </GroupBox>
     </Grid>
 </Window>

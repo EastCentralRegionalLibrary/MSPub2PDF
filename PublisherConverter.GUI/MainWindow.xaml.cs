@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -13,9 +14,13 @@ namespace PublisherConverter.GUI
         private CancellationTokenSource? _cts;
         private readonly ConverterEngine _engine;
 
+        private ObservableCollection<string> LogMessages { get; set; } = new ObservableCollection<string>();
+
         public MainWindow()
         {
             InitializeComponent();
+
+            LstConsoleLog.ItemsSource = LogMessages;
 
             var inspector = new PublisherInspector();
             var hashProvider = new HashProvider();
@@ -70,7 +75,7 @@ namespace PublisherConverter.GUI
 
             // Configure layout interaction lockout bounds
             ToggleUiControls(isRunning: true);
-            TxtConsoleLog.Clear();
+
             ProgressIndicator.Value = 0;
 
             _cts = new CancellationTokenSource();
@@ -166,9 +171,22 @@ namespace PublisherConverter.GUI
 
         private void AppendConsoleLog(string message)
         {
-            string timeStamp = DateTime.Now.ToString("HH:mm:ss");
-            TxtConsoleLog.AppendText($"[{timeStamp}] {message}{Environment.NewLine}");
-            TxtConsoleLog.ScrollToEnd(); // Force UI container to track bottom line
+            App.Current.Dispatcher.Invoke(() =>
+            {
+                LogMessages.Add($"[{DateTime.Now:HH:mm:ss}] {message}");
+
+                // Keep a maximum buffer of 500 items
+                if (LogMessages.Count > 500)
+                {
+                    LogMessages.RemoveAt(0);
+                }
+
+                // Scroll to the latest entry
+                if (LogMessages.Count > 0)
+                {
+                    LstConsoleLog.ScrollIntoView(LogMessages[LogMessages.Count - 1]);
+                }
+            });
         }
     }
 }
