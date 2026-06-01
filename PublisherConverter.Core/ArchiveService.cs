@@ -1,21 +1,26 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 
 namespace PublisherConverter.Core
 {
-    public class ArchiveService
+    public class ArchiveService : IArchiveService
     {
         private readonly string _targetBackupRoot;
+        private readonly bool _compress;
         private string? _stagingDirectory;
 
-        public ArchiveService(string targetBackupRoot)
+        public ArchiveService(string targetBackupRoot, bool compress = false)
         {
             _targetBackupRoot = targetBackupRoot;
+            _compress = compress;
         }
 
+        public bool Compress => _compress;
+
         /// <summary>
-        /// Instantiates a unique, timestamped backup directory block inside the target repository layout.
+        /// Creates a unique, timestamped backup directory.
         /// </summary>
         public void Initialize()
         {
@@ -31,7 +36,7 @@ namespace PublisherConverter.Core
         }
 
         /// <summary>
-        /// Carbon-copies an asset item while perfectly maintaining its original relative subfolder tree structures.
+        /// Copies a file to the staging directory, preserving relative path structure.
         /// </summary>
         public void StageFile(string sourceFullPath, string relativePath, string fileName)
         {
@@ -48,7 +53,7 @@ namespace PublisherConverter.Core
         }
 
         /// <summary>
-        /// Packs the temporary workspace directory structures into a single compressed ZIP package and cleans up staging footprints.
+        /// Finalizes the archive by optionally compressing it and cleaning up the staging directory.
         /// </summary>
         public void FinalizeArchive()
         {
@@ -56,8 +61,10 @@ namespace PublisherConverter.Core
 
             try
             {
-                // Verify if any items were successfully staged before pulling the ZIP triggers
-                if (Directory.GetFiles(_stagingDirectory, "*", SearchOption.AllDirectories).Length > 0)
+                // Verify if any items were successfully staged before creating the ZIP
+                bool hasFiles = Directory.GetFiles(_stagingDirectory, "*", SearchOption.AllDirectories).Length > 0;
+
+                if (_compress && hasFiles)
                 {
                     string finalZipPath = _stagingDirectory + ".zip";
                     ZipFile.CreateFromDirectory(_stagingDirectory, finalZipPath, CompressionLevel.Optimal, includeBaseDirectory: false);
@@ -65,8 +72,16 @@ namespace PublisherConverter.Core
             }
             finally
             {
-                // Always scrub the uncompressed file tree workspace footprint from storage
+                // Always scrub the uncompressed file tree workspace footprint from storage when finalized
                 Directory.Delete(_stagingDirectory, true);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (!string.IsNullOrEmpty(_stagingDirectory) && Directory.Exists(_stagingDirectory))
+            {
+                try { Directory.Delete(_stagingDirectory, true); } catch { }
             }
         }
     }

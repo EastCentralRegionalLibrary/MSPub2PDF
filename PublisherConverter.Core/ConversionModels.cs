@@ -26,6 +26,8 @@ namespace PublisherConverter.Core
         public long SourceSizeLength { get; set; }
         public string SourceHash { get; set; } = "N/A";
         public string OutputHash { get; set; } = "N/A";
+        public bool HasMacros { get; set; } = false;
+        public DateTime ProcessedAtUtc { get; set; }
         public MigrationStatus Status { get; set; } = MigrationStatus.Pending;
         public string Details { get; set; } = "Pending processing.";
         public int MissingAssetsCount { get; set; } = 0;
@@ -48,6 +50,7 @@ namespace PublisherConverter.Core
         public string SourcePath { get; set; } = string.Empty;
         public string ArchivePath { get; set; } = string.Empty;
         public bool RunLinkCheck { get; set; } = true;
+        public string? ManifestOutputPath { get; set; }
         public bool CompressArchive { get; set; } = false;
         public bool DeleteSourceOnSuccess { get; set; } = false;
         public int ProcessRecycleInterval { get; set; } = 50;

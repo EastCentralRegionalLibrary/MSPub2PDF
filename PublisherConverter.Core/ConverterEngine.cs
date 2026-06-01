@@ -9,252 +9,325 @@ namespace PublisherConverter.Core
 {
     public class ConverterEngine
     {
-        public Task ExecuteMigrationAsync(ConversionOptions options, IProgress<ProgressReport> progress, CancellationToken cancellationToken)
+        private readonly IFileInspector _inspector;
+        private readonly IHashProvider _hashProvider;
+        private readonly IManifestWriter _manifestWriter;
+        private readonly IPublisherRenderer _renderer;
+        private readonly Func<string, bool, IArchiveService> _archiveServiceFactory;
+
+        public ConverterEngine(
+            IFileInspector inspector,
+            IHashProvider hashProvider,
+            IManifestWriter manifestWriter,
+            IPublisherRenderer renderer,
+            Func<string, bool, IArchiveService> archiveServiceFactory)
         {
-            var tcs = new TaskCompletionSource();
+            _inspector = inspector;
+            _hashProvider = hashProvider;
+            _manifestWriter = manifestWriter;
+            _renderer = renderer;
+            _archiveServiceFactory = archiveServiceFactory;
+        }
 
-            var orchestratorThread = new Thread(() =>
+        public async Task ExecuteMigrationAsync(ConversionOptions options, IProgress<ProgressReport> progress, CancellationToken cancellationToken)
+        {
+            await ExecuteMigrationAsync(options, new ProgressReporterWrapper(progress), cancellationToken);
+        }
+
+        public async Task ExecuteMigrationAsync(ConversionOptions options, IProgressReporter reporter, CancellationToken cancellationToken)
+        {
+            List<FileRecord> indexedFiles = new List<FileRecord>();
+            var report = new ProgressReport();
+            string scratchRoot = Path.Combine(Path.GetTempPath(), "MSPub2PDF", Guid.NewGuid().ToString("N"));
+            IArchiveService? archiveService = null;
+
+            if (!string.IsNullOrEmpty(options.ArchivePath))
             {
-                var report = new ProgressReport();
-                string scratchRoot = Path.Combine(Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\", "_pubscratch");
-                var indexedFiles = new List<FileRecord>();
-                ArchiveService? archiveService = null;
-
-                var lifecycleManager = new PublisherLifecycleManager(maxConsecutiveFailures: 3);
-
-                if (!string.IsNullOrEmpty(options.ArchivePath))
-                {
-                    try
-                    {
-                        archiveService = new ArchiveService(options.ArchivePath);
-                        archiveService.Initialize();
-                    }
-                    catch (Exception ex)
-                    {
-                        tcs.SetException(new InvalidOperationException($"Failed to initialize backup directory structure: {ex.Message}", ex));
-                        return;
-                    }
-                }
-
                 try
                 {
-                    // Phase 1: Discovery & Indexing
-                    progress.Report(UpdateProgressState(report, "Scanning source folder for active Publisher files...", null));
-                    if (!Directory.Exists(options.SourcePath)) throw new DirectoryNotFoundException("Source path selection is invalid.");
+                    archiveService = _archiveServiceFactory(options.ArchivePath, options.CompressArchive);
+                    archiveService.Initialize();
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException($"Failed to initialize backup directory structure: {ex.Message}", ex);
+                }
+            }
 
-                    var files = Directory.GetFiles(options.SourcePath, "*.pub", SearchOption.AllDirectories);
-                    report.TotalFiles = files.Length;
+            try
+            {
+                // Phase 1: Discovery & Indexing
+                reporter.Report(UpdateProgressState(report, "Scanning source folder for Publisher files...", null));
+                if (!Directory.Exists(options.SourcePath)) throw new DirectoryNotFoundException("Source path selection is invalid.");
 
-                    if (report.TotalFiles == 0)
+                if (!IsDirectoryWritable(options.SourcePath)) throw new UnauthorizedAccessException($"Source directory is not writable: {options.SourcePath}");
+                if (!string.IsNullOrEmpty(options.ArchivePath) && !IsDirectoryWritable(options.ArchivePath)) throw new UnauthorizedAccessException($"Archive directory is not writable: {options.ArchivePath}");
+                if (!string.IsNullOrEmpty(options.ManifestOutputPath) && !IsDirectoryWritable(options.ManifestOutputPath)) throw new UnauthorizedAccessException($"Manifest output directory is not writable: {options.ManifestOutputPath}");
+
+                var files = FindPubFiles(options.SourcePath);
+                report.TotalFiles = files.Count;
+
+                if (report.TotalFiles == 0)
+                {
+                    reporter.Report(UpdateProgressState(report, "No .pub files found.", null));
+                    return;
+                }
+
+                foreach (var file in files)
+                {
+                    string relativePathFile = Path.GetRelativePath(options.SourcePath, file);
+                    string relative = Path.GetDirectoryName(relativePathFile) ?? "";
+                    if (relative == ".") relative = "";
+
+                    var info = new FileInfo(file);
+                    indexedFiles.Add(new FileRecord
                     {
-                        progress.Report(UpdateProgressState(report, "Run complete. Zero .pub targets discovered.", null));
-                        tcs.SetResult();
-                        return;
+                        FileName = info.Name,
+                        RelativePath = relative,
+                        OriginalFullPath = file,
+                        CreationTime = info.CreationTime,
+                        LastWriteTime = info.LastWriteTime,
+                        SourceSizeLength = info.Length,
+                        LocalPubPath = Path.Combine(scratchRoot, relative.TrimStart('\\', '/'), info.Name),
+                        LocalPdfPath = Path.Combine(scratchRoot, relative.TrimStart('\\', '/'), Path.ChangeExtension(info.Name, ".pdf")),
+                        FinalPdfPath = Path.Combine(Path.GetDirectoryName(file)!, Path.ChangeExtension(info.Name, ".pdf"))
+                    });
+                }
+
+                _renderer.Initialize();
+
+                int successSinceRecycle = 0;
+
+                // Phase 2: Processing Loop
+                foreach (var record in indexedFiles)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        throw new OperationCanceledException(cancellationToken);
                     }
 
-                    foreach (var file in files)
+                    if (options.ProcessRecycleInterval > 0 && successSinceRecycle >= options.ProcessRecycleInterval)
                     {
-                        string relativePathFile = Path.GetRelativePath(options.SourcePath, file);
-                        string relative = Path.GetDirectoryName(relativePathFile) ?? "";
-                        if (relative == ".") relative = "";
-
-                        var info = new FileInfo(file);
-                        indexedFiles.Add(new FileRecord
-                        {
-                            FileName = info.Name,
-                            RelativePath = relative,
-                            OriginalFullPath = file,
-                            CreationTime = info.CreationTime,
-                            LastWriteTime = info.LastWriteTime,
-                            SourceSizeLength = info.Length,
-                            LocalPubPath = Path.Combine(scratchRoot, relative.TrimStart('\\', '/'), info.Name),
-                            LocalPdfPath = Path.Combine(scratchRoot, relative.TrimStart('\\', '/'), Path.ChangeExtension(info.Name, ".pdf")),
-                            FinalPdfPath = Path.Combine(Path.GetDirectoryName(file)!, Path.ChangeExtension(info.Name, ".pdf"))
-                        });
+                        _renderer.Recycle();
+                        successSinceRecycle = 0;
                     }
 
-                    lifecycleManager.InitializeEngine();
+                    // Step A: Static Triage
+                    var safety = _inspector.InspectFile(record.OriginalFullPath);
+                    record.HasMacros = safety.HasMacros;
 
-                    // Phase 2: Processing Loop
-                    foreach (var record in indexedFiles)
+                    if (safety.IsPasswordProtected || safety.IsCorruptedOrInvalid)
                     {
-                        if (cancellationToken.IsCancellationRequested)
-                        {
-                            throw new OperationCanceledException(cancellationToken);
-                        }
+                        record.Status = MigrationStatus.FailedConversion;
+                        record.Details = safety.Reason;
 
-                        // Step A: Static Triage
-                        var safety = PublisherInspector.InspectFile(record.OriginalFullPath);
-                        if (safety.IsPasswordProtected || safety.IsCorruptedOrInvalid)
-                        {
-                            record.Status = MigrationStatus.FailedConversion;
-                            record.Details = safety.Reason;
+                        report.FailureCount++;
+                        report.ProcessedFiles++;
+                        reporter.Report(UpdateProgressState(report, $"Skipped static triage: {record.FileName}", record));
+                        continue;
+                    }
+                    record.SourceHash = _hashProvider.GetSha256Hash(record.OriginalFullPath);
 
-                            report.FailureCount++;
-                            report.ProcessedFiles++;
-                            progress.Report(UpdateProgressState(report, $"Skipped static triage: {record.FileName}", record));
-                            continue;
-                        }
-                        record.SourceHash = GetSha256Hash(record.OriginalFullPath);
-
-                        // Step B: Ingress Staging
-                        try
+                    // Step B: Ingress Staging
+                    try
+                    {
+                        if (IsRemotePath(record.OriginalFullPath))
                         {
                             string localDir = Path.GetDirectoryName(record.LocalPubPath)!;
                             if (!Directory.Exists(localDir)) Directory.CreateDirectory(localDir);
                             File.Copy(record.OriginalFullPath, record.LocalPubPath, true);
-                            record.Status = MigrationStatus.Staged;
-                        }
-                        catch (Exception ex)
-                        {
-                            record.Status = MigrationStatus.FailedIngress;
-                            record.Details = $"Ingress Lock/IO Exception: {ex.Message}";
-
-                            report.FailureCount++;
-                            report.ProcessedFiles++;
-                            progress.Report(UpdateProgressState(report, $"Ingress Failure: {record.FileName}", record));
-                            continue;
-                        }
-
-                        const int maxFileAttempts = 3;
-                        bool renderingSucceeded = false;
-                        Exception? lastRenderingException = null;
-
-                        // Intra-File Local Retry Loop
-                        for (int attempt = 1; attempt <= maxFileAttempts; attempt++)
-                        {
-                            if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken);
-
-                            string attemptPrefix = attempt > 1 ? $"[Retry {attempt}/{maxFileAttempts}] " : "";
-                            progress.Report(UpdateProgressState(report, $"{attemptPrefix}Processing: {record.FileName}", record));
-
-                            try
-                            {
-                                lifecycleManager.ExecuteRenderingJob(record, record.LocalPubPath, record.LocalPdfPath, options.RunLinkCheck, options.FileTimeoutSeconds, cancellationToken);
-                                renderingSucceeded = true;
-                                break;
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                throw;
-                            }
-                            catch (Exception ex)
-                            {
-                                lastRenderingException = ex;
-
-                                if (attempt < maxFileAttempts)
-                                {
-                                    record.Details = $"Attempt {attempt} thrown out ({ex.GetType().Name}). Accessing local retry block...";
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // FIX: Evaluate execution resolution OUTSIDE the attempt loop to calculate the proper global health metric
-                        if (renderingSucceeded)
-                        {
-                            // File converted perfectly on one of its local retries. Clear the global strike counter!
-                            lifecycleManager.RecordBatchSuccess();
-                            record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
                         }
                         else
                         {
-                            // FIX: The file has completely exhausted all 3 local retries. Record a batch strike.
-                            // If 3 completely different files do this back-to-back, this call trips the circuit breaker and stops the run.
-                            lifecycleManager.RecordBatchFailure();
-
-                            record.Status = MigrationStatus.FailedConversion;
-                            record.Details = lastRenderingException is TimeoutException
-                                ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
-                                : $"COM Rendering Exception: {lastRenderingException?.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
+                            record.LocalPubPath = record.OriginalFullPath;
+                            string scratchDir = Path.GetDirectoryName(record.LocalPdfPath)!;
+                            if (!Directory.Exists(scratchDir)) Directory.CreateDirectory(scratchDir);
                         }
+                        record.Status = MigrationStatus.Staged;
+                    }
+                    catch (Exception ex)
+                    {
+                        record.Status = MigrationStatus.FailedIngress;
+                        record.Details = $"Ingress Lock/IO Exception: {ex.Message}";
 
-                        // Step C: Egress & Metadata Output Cloning
-                        if (renderingSucceeded)
+                        report.FailureCount++;
+                        report.ProcessedFiles++;
+                        reporter.Report(UpdateProgressState(report, $"Ingress Failure: {record.FileName}", record));
+                        continue;
+                    }
+
+                    const int maxFileAttempts = 3;
+                    bool renderingSucceeded = false;
+                    Exception? lastRenderingException = null;
+
+                    // Intra-File Local Retry Loop
+                    for (int attempt = 1; attempt <= maxFileAttempts; attempt++)
+                    {
+                        if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken);
+
+                        string attemptPrefix = attempt > 1 ? $"[Retry {attempt}/{maxFileAttempts}] " : "";
+                        reporter.Report(UpdateProgressState(report, $"{attemptPrefix}Processing: {record.FileName}", record));
+
+                        try
+                        {
+                            await _renderer.ExecuteRenderingJobAsync(record, record.LocalPubPath, record.LocalPdfPath, options.RunLinkCheck, options.FileTimeoutSeconds, cancellationToken);
+                            renderingSucceeded = true;
+                            break;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            lastRenderingException = ex;
+
+                            if (attempt < maxFileAttempts)
+                            {
+                                record.Details = $"Attempt {attempt} thrown out ({ex.GetType().Name}). Accessing local retry block...";
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Evaluate execution resolution OUTSIDE the attempt loop to calculate the proper global health metric
+                    if (renderingSucceeded)
+                    {
+                        // File converted perfectly on one of its local retries. Clear the global strike counter!
+                        _renderer.RecordBatchSuccess();
+                        record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
+                    }
+                    else
+                    {
+                        // The file has completely exhausted all 3 local retries. Record a batch strike.
+                        // If 3 completely different files do this back-to-back, this call trips the circuit breaker and stops the run.
+                        bool tripBreaker = _renderer.RecordBatchFailure();
+
+                        record.Status = MigrationStatus.FailedConversion;
+                        record.Details = lastRenderingException is TimeoutException
+                            ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
+                            : $"COM Rendering Exception: {lastRenderingException?.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
+
+                        if (tripBreaker)
+                        {
+                            throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
+                        }
+                    }
+
+                    // Step C: Egress & Metadata Output Cloning
+                    if (renderingSucceeded)
+                    {
+                        try
+                        {
+                            if (IsPlausiblePdf(record.LocalPdfPath))
+                            {
+                                if (File.Exists(record.FinalPdfPath))
+                                {
+                                    string backupPath = record.FinalPdfPath + ".old";
+                                    if (File.Exists(backupPath)) File.Delete(backupPath);
+                                    File.Move(record.FinalPdfPath, backupPath);
+                                }
+
+                                if (record.LocalPdfPath != record.FinalPdfPath)
+                                {
+                                    File.Copy(record.LocalPdfPath, record.FinalPdfPath, true);
+                                }
+
+                                var finalPdfInfo = new FileInfo(record.FinalPdfPath)
+                                {
+                                    CreationTime = record.CreationTime,
+                                    LastWriteTime = record.LastWriteTime
+                                };
+
+                                record.OutputHash = _hashProvider.GetSha256Hash(record.FinalPdfPath);
+                                record.Details = record.MissingAssetsCount > 0
+                                    ? $"Archived cleanly but missing {record.MissingAssetsCount} external dependencies."
+                                    : "Converted cleanly to PDF/A.";
+
+                                archiveService?.StageFile(record.OriginalFullPath, record.RelativePath, record.FileName);
+                            }
+                            else
+                            {
+                                record.Status = MigrationStatus.FailedEgress;
+                                record.Details = $"PDF generation completed but scratch file was missing at {record.LocalPdfPath}.";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            record.Status = MigrationStatus.FailedEgress;
+                            record.Details = $"Egress Save Failure: {ex.Message}";
+                        }
+                    }
+
+                    if (record.Status == MigrationStatus.VerifiedComplete)
+                    {
+                        report.SuccessCount++;
+                        successSinceRecycle++;
+                    }
+                    else if (record.Status == MigrationStatus.VerifiedWithWarnings)
+                    {
+                        report.WarningCount++;
+                        successSinceRecycle++;
+                    }
+                    else report.FailureCount++;
+
+                    record.ProcessedAtUtc = DateTime.UtcNow;
+                    report.ProcessedFiles++;
+                    reporter.Report(UpdateProgressState(report, $"Finished: {record.FileName}", record));
+                }
+
+                if (archiveService != null)
+                {
+                    reporter.Report(UpdateProgressState(report, "Creating ZIP archive...", null));
+                    archiveService.FinalizeArchive();
+                }
+
+                if (options.DeleteSourceOnSuccess)
+                {
+                    reporter.Report(UpdateProgressState(report, "Deleting successfully converted source files...", null));
+                    foreach (var record in indexedFiles)
+                    {
+                        if (record.Status == MigrationStatus.VerifiedComplete && IsPlausiblePdf(record.FinalPdfPath))
                         {
                             try
                             {
-                                if (File.Exists(record.LocalPdfPath))
+                                if (record.OriginalFullPath != record.FinalPdfPath)
                                 {
-                                    File.Copy(record.LocalPdfPath, record.FinalPdfPath, true);
-
-                                    var finalPdfInfo = new FileInfo(record.FinalPdfPath)
-                                    {
-                                        CreationTime = record.CreationTime,
-                                        LastWriteTime = record.LastWriteTime
-                                    };
-
-                                    record.OutputHash = GetSha256Hash(record.FinalPdfPath);
-                                    record.Details = record.MissingAssetsCount > 0
-                                        ? $"Archived cleanly but missing {record.MissingAssetsCount} external dependencies."
-                                        : "Converted cleanly to PDF/A.";
-
-                                    archiveService?.StageFile(record.OriginalFullPath, record.RelativePath, record.FileName);
-                                }
-                                else
-                                {
-                                    record.Status = MigrationStatus.FailedEgress;
-                                    record.Details = "PDF generation completed but scratch file was missing.";
+                                    File.Delete(record.OriginalFullPath);
                                 }
                             }
-                            catch (Exception ex)
-                            {
-                                record.Status = MigrationStatus.FailedEgress;
-                                record.Details = $"Egress Save Failure: {ex.Message}";
-                            }
-                        }
-
-                        if (record.Status == MigrationStatus.VerifiedComplete) report.SuccessCount++;
-                        else if (record.Status == MigrationStatus.VerifiedWithWarnings) report.WarningCount++;
-                        else report.FailureCount++;
-
-                        report.ProcessedFiles++;
-                        progress.Report(UpdateProgressState(report, $"Finished: {record.FileName}", record));
-                    }
-
-                    if (archiveService != null)
-                    {
-                        progress.Report(UpdateProgressState(report, "Compressing historical archive repository to ZIP container...", null));
-                        archiveService.FinalizeArchive();
-                    }
-
-                    if (options.DeleteSourceOnSuccess)
-                    {
-                        progress.Report(UpdateProgressState(report, "Cleaning up source network footprints...", null));
-                        foreach (var record in indexedFiles)
-                        {
-                            if ((record.Status == MigrationStatus.VerifiedComplete || record.Status == MigrationStatus.VerifiedWithWarnings) && File.Exists(record.FinalPdfPath))
-                            {
-                                try { File.Delete(record.OriginalFullPath); } catch { }
-                            }
+                            catch { }
                         }
                     }
+                }
+            }
+            finally
+            {
+                string manifestDir = options.ManifestOutputPath ?? (archiveService != null ? options.ArchivePath : options.SourcePath);
+                _manifestWriter.WriteManifest(manifestDir, indexedFiles);
 
-                    ExportAuditTrailCsv(options.SourcePath, indexedFiles);
-                    tcs.SetResult();
-                }
-                catch (OperationCanceledException ex)
+                _renderer.Shutdown();
+                if (Directory.Exists(scratchRoot))
                 {
-                    tcs.SetCanceled(ex.CancellationToken);
+                    try { Directory.Delete(scratchRoot, true); } catch { }
                 }
-                catch (Exception ex)
-                {
-                    tcs.SetException(ex);
-                }
-                finally
-                {
-                    lifecycleManager.ShutdownEngine();
-                    if (Directory.Exists(scratchRoot))
-                    {
-                        try { Directory.Delete(scratchRoot, true); } catch { }
-                    }
-                }
-            });
+                archiveService?.Dispose();
+            }
+        }
 
-            orchestratorThread.IsBackground = true;
-            orchestratorThread.Start();
+        public static List<string> FindPubFiles(string root)
+        {
+            var results = new List<string>();
+            if (!Directory.Exists(root)) return results;
 
-            return tcs.Task;
+            foreach (var file in Directory.GetFiles(root, "*.pub", SearchOption.AllDirectories))
+            {
+                if (Path.GetExtension(file).Equals(".pub", StringComparison.OrdinalIgnoreCase))
+                {
+                    results.Add(file);
+                }
+            }
+            return results;
         }
 
         private ProgressReport UpdateProgressState(ProgressReport masterReport, string actionMessage, FileRecord? currentFile)
@@ -271,24 +344,61 @@ namespace PublisherConverter.Core
             };
         }
 
-        public static string GetSha256Hash(string filePath)
+        public static bool IsDirectoryWritable(string dirPath)
         {
-            if (!File.Exists(filePath)) return "Missing";
-            using var sha = System.Security.Cryptography.SHA256.Create();
-            using var stream = File.OpenRead(filePath);
-            return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            try
+            {
+                if (!Directory.Exists(dirPath)) Directory.CreateDirectory(dirPath);
+                string probeFile = Path.Combine(dirPath, Guid.NewGuid().ToString("N") + ".tmp");
+                File.WriteAllText(probeFile, "probe");
+                File.Delete(probeFile);
+                return true;
+            }
+            catch { return false; }
         }
 
-        private void ExportAuditTrailCsv(string directory, List<FileRecord> records)
+        public static bool IsRemotePath(string path)
         {
-            string csvPath = Path.Combine(directory, $"MigrationManifest_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
-            using var writer = new StreamWriter(csvPath, false, System.Text.Encoding.UTF8);
-            writer.WriteLine("Timestamp,FileName,RelativeFolder,Status,SourceHash,OutputHash,MissingLinkCount,Details,LinkManifest");
+            // Detect UNC paths or explicit network drive patterns if possible (OS specific)
+            return path.StartsWith("\\\\") || path.StartsWith("//");
+        }
 
-            foreach (var r in records)
+        public static bool IsPlausiblePdf(string path)
+        {
+            if (!File.Exists(path)) return false;
+            var info = new FileInfo(path);
+            if (info.Length < 10) return false;
+
+            try
             {
-                writer.WriteLine($"\"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\",\"{r.FileName}\",\"{r.RelativePath}\",\"{r.Status}\",\"{r.SourceHash}\",\"{r.OutputHash}\",{r.MissingAssetsCount},\"{r.Details.Replace("\"", "\"\"")}\",\"{r.MissingAssetsList.Replace("\"", "\"\"")}\"");
+                using var stream = File.OpenRead(path);
+                byte[] buffer = new byte[5];
+                stream.Read(buffer, 0, 5);
+                string header = System.Text.Encoding.ASCII.GetString(buffer);
+                return header.Equals("%PDF-", StringComparison.OrdinalIgnoreCase);
             }
+            catch { return false; }
+        }
+
+        public static string CsvEscape(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "\"\"";
+
+            string escapedValue = value;
+            // Neutralize formula-injection leads
+            if (escapedValue.StartsWith("=") || escapedValue.StartsWith("+") || escapedValue.StartsWith("-") || escapedValue.StartsWith("@"))
+            {
+                escapedValue = "'" + escapedValue;
+            }
+
+            return "\"" + escapedValue.Replace("\"", "\"\"") + "\"";
+        }
+
+        private class ProgressReporterWrapper : IProgressReporter
+        {
+            private readonly IProgress<ProgressReport> _inner;
+            public ProgressReporterWrapper(IProgress<ProgressReport> inner) => _inner = inner;
+            public void Report(ProgressReport report) => _inner.Report(report);
         }
     }
 }

@@ -11,11 +11,24 @@ namespace PublisherConverter.GUI
     public partial class MainWindow : Window
     {
         private CancellationTokenSource? _cts;
-        private readonly ConverterEngine _engine = new ConverterEngine();
+        private readonly ConverterEngine _engine;
 
         public MainWindow()
         {
             InitializeComponent();
+
+            var inspector = new PublisherInspector();
+            var hashProvider = new HashProvider();
+            var manifestWriter = new ManifestWriter();
+            var renderer = new PublisherLifecycleManager();
+
+            _engine = new ConverterEngine(
+                inspector,
+                hashProvider,
+                manifestWriter,
+                renderer,
+                (path, compress) => new ArchiveService(path, compress)
+            );
         }
 
         // Folder Picker helper logic using standard Windows Dialog hooks
