@@ -69,6 +69,15 @@ namespace PublisherConverter.Core
     {
         void Initialize();
         RenderResult Render(RenderJob job);
+
+        /// <summary>
+        /// Raised asynchronously when the renderer detects that its underlying
+        /// rendering engine has died (e.g., Publisher's mspub.exe terminated
+        /// out from under us). The worker host subscribes so it can tear down
+        /// immediately instead of waiting for the in-flight Render call to
+        /// time out — a stuck COM RPC will not unblock on its own.
+        /// </summary>
+        event EventHandler? EngineCrashed;
     }
 
     public interface IProcessLauncher

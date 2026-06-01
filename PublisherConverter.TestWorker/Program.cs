@@ -24,10 +24,11 @@ namespace PublisherConverter.TestWorker
             string scenario = ParseArgument(args, "--scenario");
             IDocumentRenderer renderer = scenario switch
             {
-                "fail-init"   => new FailingInitRenderer(),
-                "fail-render" => new FailingRenderRenderer(),
-                "hang-render" => new HangingRenderer(),
-                "crash-on-render" => new CrashOnRenderRenderer(),
+                "fail-init"        => new FailingInitRenderer(),
+                "fail-render"      => new FailingRenderRenderer(),
+                "hang-render"      => new HangingRenderer(),
+                "crash-on-render"  => new CrashOnRenderRenderer(),
+                "engine-crash"     => new EngineCrashRenderer(),
                 _ => new StubDocumentRenderer(),
             };
 

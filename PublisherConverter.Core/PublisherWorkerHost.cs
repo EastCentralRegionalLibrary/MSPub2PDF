@@ -10,6 +10,10 @@ namespace PublisherConverter.Core
     /// </summary>
     public class PublisherWorkerHost
     {
+        // Process exit code used when the host force-exits because the
+        // underlying rendering engine died asynchronously.
+        public const int EngineCrashedExitCode = 2;
+
         private readonly string _pipeName;
         private readonly IDocumentRenderer _renderer;
 
@@ -33,6 +37,17 @@ namespace PublisherConverter.Core
                 return;
             }
 
+            // If the engine dies asynchronously (Publisher process crashed,
+            // user closed Publisher manually, etc.), the in-flight Render
+            // call is almost certainly stuck in a COM RPC that will never
+            // return. Closing the pipe lets the client see EOF immediately;
+            // hard-exiting escapes the stuck call so the client can recycle.
+            EventHandler crashHandler = (_, _) =>
+            {
+                try { transport.Dispose(); } catch { }
+                Environment.Exit(EngineCrashedExitCode);
+            };
+
             bool rendererInitialized = false;
             try
             {
@@ -40,6 +55,7 @@ namespace PublisherConverter.Core
                 {
                     _renderer.Initialize();
                     rendererInitialized = true;
+                    _renderer.EngineCrashed += crashHandler;
                 }
                 catch (Exception ex)
                 {
@@ -76,6 +92,7 @@ namespace PublisherConverter.Core
             {
                 if (rendererInitialized)
                 {
+                    try { _renderer.EngineCrashed -= crashHandler; } catch { }
                     try { _renderer.Dispose(); } catch { }
                 }
             }
