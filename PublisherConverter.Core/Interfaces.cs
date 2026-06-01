@@ -8,6 +8,7 @@ namespace PublisherConverter.Core
     public interface IPublisherRenderer
     {
         void Initialize();
+        Task InitializeAsync(CancellationToken cancellationToken);
         void Shutdown();
         Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken);
         void Recycle();
@@ -42,5 +43,45 @@ namespace PublisherConverter.Core
     public interface IManifestWriter
     {
         void WriteManifest(string directory, List<FileRecord> records);
+    }
+
+    public interface IPublisherWorkerClient : IDisposable
+    {
+        Task<WorkerResponse> SendRequestAsync(WorkerRequest request, int? timeoutSeconds, CancellationToken cancellationToken);
+        void EnsureWorkerStarted();
+        Task EnsureWorkerStartedAsync(CancellationToken cancellationToken);
+        void RecycleWorker();
+        bool IsHealthy { get; }
+    }
+
+    public interface IWorkerTransport : IDisposable
+    {
+        Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken);
+        Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken);
+        void Connect();
+        Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null);
+    }
+
+    public interface IProcessLauncher
+    {
+        IProcessHandle StartWorker();
+    }
+
+    public interface IProcessHandle : IDisposable
+    {
+        int Id { get; }
+        bool HasExited { get; }
+        void Kill();
+        event EventHandler Exited;
+    }
+
+    public interface IWorkerHealthMonitor
+    {
+        bool IsProcessHealthy(IProcessHandle? handle);
+    }
+
+    public interface ITimeoutProvider
+    {
+        TimeSpan GetTimeout(string command);
     }
 }

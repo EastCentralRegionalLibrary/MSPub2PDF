@@ -27,6 +27,7 @@ namespace PublisherConverter.Tests
         public Queue<Func<FileRecord, Task>> RenderBehaviors { get; } = new Queue<Func<FileRecord, Task>>();
 
         public void Initialize() { }
+        public async Task InitializeAsync(CancellationToken cancellationToken) { await Task.CompletedTask; }
         public void Shutdown() { ShutdownCalled = true; }
 
         public async Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
@@ -90,5 +91,77 @@ namespace PublisherConverter.Tests
             WrittenDirectory = directory;
             WrittenRecords = new List<FileRecord>(records);
         }
+    }
+
+    public class FakeProcessLauncher : IProcessLauncher
+    {
+        public List<FakeProcessHandle> CreatedProcesses { get; } = new List<FakeProcessHandle>();
+        public IProcessHandle StartWorker()
+        {
+            var handle = new FakeProcessHandle(CreatedProcesses.Count + 1);
+            CreatedProcesses.Add(handle);
+            return handle;
+        }
+    }
+
+    public class FakeProcessHandle : IProcessHandle
+    {
+        public int Id { get; }
+        public bool HasExited { get; set; }
+        public bool Killed { get; private set; }
+        public event EventHandler? Exited;
+
+        public FakeProcessHandle(int id) => Id = id;
+
+        public void Kill()
+        {
+            Killed = true;
+            HasExited = true;
+            Exited?.Invoke(this, EventArgs.Empty);
+        }
+
+        public void Dispose() { }
+    }
+
+    public class FakeWorkerTransport : IWorkerTransport
+    {
+        public Queue<WorkerResponse> Responses { get; } = new Queue<WorkerResponse>();
+        public List<WorkerRequest> SentRequests { get; } = new List<WorkerRequest>();
+        public bool Connected { get; private set; }
+        public bool Disposed { get; private set; }
+
+        public void Connect() => Connected = true;
+
+        public Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null)
+        {
+            Connected = true;
+            return Task.CompletedTask;
+        }
+
+        public Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken)
+        {
+            SentRequests.Add(request);
+            return Task.CompletedTask;
+        }
+
+        public virtual Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
+        {
+            if (Responses.Count > 0) return Task.FromResult(Responses.Dequeue());
+            return Task.FromResult(new WorkerResponse { Success = true });
+        }
+
+        public void Dispose() => Disposed = true;
+    }
+
+    public class FakeWorkerHealthMonitor : IWorkerHealthMonitor
+    {
+        public bool IsHealthy { get; set; } = true;
+        public bool IsProcessHealthy(IProcessHandle? handle) => IsHealthy && handle != null && !handle.HasExited;
+    }
+
+    public class FakeTimeoutProvider : ITimeoutProvider
+    {
+        public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(60);
+        public TimeSpan GetTimeout(string command) => Timeout;
     }
 }
