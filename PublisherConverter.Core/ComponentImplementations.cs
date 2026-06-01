@@ -21,13 +21,13 @@ namespace PublisherConverter.Core
         public void WriteManifest(string directory, List<FileRecord> records)
         {
             if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
-            string csvPath = Path.Combine(directory, $"MigrationManifest_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+            string csvPath = Path.Combine(directory, $"MigrationManifest_{DateTime.UtcNow:yyyyMMdd_HHmmss}Z.csv");
             using var writer = new StreamWriter(csvPath, false, System.Text.Encoding.UTF8);
             writer.WriteLine("Timestamp,FileName,RelativeFolder,Status,SourceHash,OutputHash,HasMacros,MissingLinkCount,Details,LinkManifest");
 
             foreach (var r in records)
             {
-                writer.WriteLine($"{ConverterEngine.CsvEscape(r.ProcessedAtUtc.ToString("yyyy-MM-dd HH:mm:ss"))}," +
+                writer.WriteLine($"{ConverterEngine.CsvEscape(r.ProcessedAtUtc.ToString("yyyy-MM-dd HH:mm:ssZ"))}," +
                                  $"{ConverterEngine.CsvEscape(r.FileName)}," +
                                  $"{ConverterEngine.CsvEscape(r.RelativePath)}," +
                                  $"{ConverterEngine.CsvEscape(r.Status.ToString())}," +

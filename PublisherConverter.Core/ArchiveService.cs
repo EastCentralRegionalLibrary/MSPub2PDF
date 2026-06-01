@@ -10,6 +10,7 @@ namespace PublisherConverter.Core
         private readonly string _targetBackupRoot;
         private readonly bool _compress;
         private string? _stagingDirectory;
+        private bool _finalized;
 
         public ArchiveService(string targetBackupRoot, bool compress = false)
         {
@@ -59,27 +60,37 @@ namespace PublisherConverter.Core
         {
             if (string.IsNullOrEmpty(_stagingDirectory) || !Directory.Exists(_stagingDirectory)) return;
 
-            try
-            {
-                // Verify if any items were successfully staged before creating the ZIP
-                bool hasFiles = Directory.GetFiles(_stagingDirectory, "*", SearchOption.AllDirectories).Length > 0;
+            bool hasFiles = Directory.GetFiles(_stagingDirectory, "*", SearchOption.AllDirectories).Length > 0;
 
-                if (_compress && hasFiles)
+            if (_compress)
+            {
+                try
                 {
-                    string finalZipPath = _stagingDirectory + ".zip";
-                    ZipFile.CreateFromDirectory(_stagingDirectory, finalZipPath, CompressionLevel.Optimal, includeBaseDirectory: false);
+                    if (hasFiles)
+                    {
+                        string finalZipPath = _stagingDirectory + ".zip";
+                        ZipFile.CreateFromDirectory(_stagingDirectory, finalZipPath, CompressionLevel.Optimal, includeBaseDirectory: false);
+                    }
+                }
+                finally
+                {
+                    Directory.Delete(_stagingDirectory, true); // scrub staging only once its contents are in the zip
                 }
             }
-            finally
+            else if (!hasFiles)
             {
-                // Always scrub the uncompressed file tree workspace footprint from storage when finalized
-                Directory.Delete(_stagingDirectory, true);
+                Directory.Delete(_stagingDirectory, true);     // nothing staged -> remove empty placeholder
             }
+            // else: uncompressed + has files -> KEEP the staging folder; it is the archive.
+
+            _finalized = true;
         }
 
         public void Dispose()
         {
-            if (!string.IsNullOrEmpty(_stagingDirectory) && Directory.Exists(_stagingDirectory))
+            // Only clean up an UN-finalized staging dir (i.e., on abandonment/error). A finalized
+            // uncompressed archive must survive Dispose.
+            if (!_finalized && !string.IsNullOrEmpty(_stagingDirectory) && Directory.Exists(_stagingDirectory))
             {
                 try { Directory.Delete(_stagingDirectory, true); } catch { }
             }

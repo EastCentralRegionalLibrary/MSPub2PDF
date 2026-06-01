@@ -123,6 +123,7 @@ namespace PublisherConverter.Core
 
                         report.FailureCount++;
                         report.ProcessedFiles++;
+                        record.ProcessedAtUtc = DateTime.UtcNow;
                         reporter.Report(UpdateProgressState(report, $"Skipped static triage: {record.FileName}", record));
                         continue;
                     }
@@ -152,6 +153,7 @@ namespace PublisherConverter.Core
 
                         report.FailureCount++;
                         report.ProcessedFiles++;
+                        record.ProcessedAtUtc = DateTime.UtcNow;
                         reporter.Report(UpdateProgressState(report, $"Ingress Failure: {record.FileName}", record));
                         continue;
                     }
@@ -193,8 +195,7 @@ namespace PublisherConverter.Core
                     // Evaluate execution resolution OUTSIDE the attempt loop to calculate the proper global health metric
                     if (renderingSucceeded)
                     {
-                        // File converted perfectly on one of its local retries. Clear the global strike counter!
-                        _renderer.RecordBatchSuccess();
+                        // Note: batch success cleared only after egress validation below
                         record.Status = record.MissingAssetsCount > 0 ? MigrationStatus.VerifiedWithWarnings : MigrationStatus.VerifiedComplete;
                     }
                     else
@@ -208,6 +209,7 @@ namespace PublisherConverter.Core
                             ? $"Execution Timeout: Process exceeded rendering thresholds across {maxFileAttempts} attempts."
                             : $"COM Rendering Exception: {lastRenderingException?.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
 
+                        record.ProcessedAtUtc = DateTime.UtcNow;
                         if (tripBreaker)
                         {
                             throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
@@ -217,13 +219,14 @@ namespace PublisherConverter.Core
                     // Step C: Egress & Metadata Output Cloning
                     if (renderingSucceeded)
                     {
+                        string? backupPath = null;
                         try
                         {
                             if (IsPlausiblePdf(record.LocalPdfPath))
                             {
                                 if (File.Exists(record.FinalPdfPath))
                                 {
-                                    string backupPath = record.FinalPdfPath + ".old";
+                                    backupPath = record.FinalPdfPath + ".old";
                                     if (File.Exists(backupPath)) File.Delete(backupPath);
                                     File.Move(record.FinalPdfPath, backupPath);
                                 }
@@ -245,17 +248,35 @@ namespace PublisherConverter.Core
                                     : "Converted cleanly to PDF/A.";
 
                                 archiveService?.StageFile(record.OriginalFullPath, record.RelativePath, record.FileName);
+                                _renderer.RecordBatchSuccess();
+
+                                if (backupPath != null && File.Exists(backupPath)) File.Delete(backupPath);
                             }
                             else
                             {
                                 record.Status = MigrationStatus.FailedEgress;
                                 record.Details = $"PDF generation completed but scratch file was missing at {record.LocalPdfPath}.";
+
+                                if (backupPath != null && File.Exists(backupPath)) File.Move(backupPath, record.FinalPdfPath, true);
+
+                                bool tripBreaker = _renderer.RecordBatchFailure();
+                                record.ProcessedAtUtc = DateTime.UtcNow;
+                                if (tripBreaker) throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
                             }
                         }
                         catch (Exception ex)
                         {
                             record.Status = MigrationStatus.FailedEgress;
                             record.Details = $"Egress Save Failure: {ex.Message}";
+
+                            if (backupPath != null && File.Exists(backupPath))
+                            {
+                                try { File.Move(backupPath, record.FinalPdfPath, true); } catch { }
+                            }
+
+                            bool tripBreaker = _renderer.RecordBatchFailure();
+                            record.ProcessedAtUtc = DateTime.UtcNow;
+                            if (tripBreaker) throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
                         }
                     }
 
@@ -303,15 +324,22 @@ namespace PublisherConverter.Core
             }
             finally
             {
-                string manifestDir = options.ManifestOutputPath ?? (archiveService != null ? options.ArchivePath : options.SourcePath);
-                _manifestWriter.WriteManifest(manifestDir, indexedFiles);
-
-                _renderer.Shutdown();
-                if (Directory.Exists(scratchRoot))
+                try
                 {
-                    try { Directory.Delete(scratchRoot, true); } catch { }
+                    string manifestDir = options.ManifestOutputPath ?? (archiveService != null ? options.ArchivePath : options.SourcePath);
+                    _manifestWriter.WriteManifest(manifestDir, indexedFiles);
                 }
-                archiveService?.Dispose();
+                catch { }
+
+                try { _renderer.Shutdown(); } catch { }
+
+                try
+                {
+                    if (Directory.Exists(scratchRoot)) Directory.Delete(scratchRoot, true);
+                }
+                catch { }
+
+                try { archiveService?.Dispose(); } catch { }
             }
         }
 
@@ -359,8 +387,22 @@ namespace PublisherConverter.Core
 
         public static bool IsRemotePath(string path)
         {
-            // Detect UNC paths or explicit network drive patterns if possible (OS specific)
-            return path.StartsWith("\\\\") || path.StartsWith("//");
+            // Detect UNC paths
+            if (path.StartsWith("\\\\") || path.StartsWith("//")) return true;
+
+            // Detect mapped network drives (Windows only)
+            try
+            {
+                string? root = Path.GetPathRoot(path);
+                if (!string.IsNullOrEmpty(root))
+                {
+                    var drive = new DriveInfo(root);
+                    return drive.DriveType == DriveType.Network;
+                }
+            }
+            catch { }
+
+            return false;
         }
 
         public static bool IsPlausiblePdf(string path)
@@ -373,7 +415,8 @@ namespace PublisherConverter.Core
             {
                 using var stream = File.OpenRead(path);
                 byte[] buffer = new byte[5];
-                stream.Read(buffer, 0, 5);
+                int read = stream.Read(buffer, 0, 5);
+                if (read < 5) return false;
                 string header = System.Text.Encoding.ASCII.GetString(buffer);
                 return header.Equals("%PDF-", StringComparison.OrdinalIgnoreCase);
             }

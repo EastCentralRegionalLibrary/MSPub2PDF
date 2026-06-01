@@ -98,6 +98,12 @@
                           VerticalAlignment="Center"
                           FontWeight="Normal"
                           Foreground="#D32F2F"/>
+                <CheckBox x:Name="ChkCompressArchive"
+                          Content="Compress archive (.zip)"
+                          IsChecked="True"
+                          Margin="0,0,25,0"
+                          VerticalAlignment="Center"
+                          FontWeight="Normal"/>
                 <StackPanel Orientation="Horizontal"
                             VerticalAlignment="Center">
                     <TextBlock Text="Recycle Engine Every:"
@@ -112,8 +118,23 @@
                              VerticalContentAlignment="Center"
                              FontWeight="Normal"/>
                     <TextBlock Text="files"
+                               Margin="0,0,25,0"
                                VerticalAlignment="Center"
                                FontWeight="Normal"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal"
+                            VerticalAlignment="Center">
+                    <TextBlock Text="Timeout (s):"
+                               VerticalAlignment="Center"
+                               FontWeight="Normal"/>
+                    <TextBox x:Name="TxtTimeout"
+                             Text="60"
+                             Width="40"
+                             Height="22"
+                             Margin="5,0,5,0"
+                             HorizontalContentAlignment="Center"
+                             VerticalContentAlignment="Center"
+                             FontWeight="Normal"/>
                 </StackPanel>
             </WrapPanel>
         </GroupBox>

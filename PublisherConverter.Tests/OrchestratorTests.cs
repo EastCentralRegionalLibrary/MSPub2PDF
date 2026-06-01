@@ -39,6 +39,26 @@ namespace PublisherConverter.Tests
         }
 
         [Fact]
+        public async Task Orchestrator_ShouldHandleManifestWritabilityFailure()
+        {
+            // Arrange
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceManifestFail");
+            Directory.CreateDirectory(sourceDir);
+            File.WriteAllText(Path.Combine(sourceDir, "test.pub"), "fake content");
+
+            _manifestWriter.ThrowOnWrite = true;
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            // Act
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            // Assert
+            Assert.True(_renderer.ShutdownCalled);
+        }
+
+        [Fact]
         public async Task Orchestrator_ShouldProcessFilesEndToEnd()
         {
             // Arrange
@@ -84,7 +104,7 @@ namespace PublisherConverter.Tests
         }
 
         [Fact]
-        public async Task Orchestrator_ShouldBackupExistingPdf()
+        public async Task Orchestrator_ShouldBackupAndRestoreExistingPdf()
         {
             // Arrange
             string sourceDir = Path.Combine(_testWorkspaceDir, "SourceBackup");
@@ -94,6 +114,13 @@ namespace PublisherConverter.Tests
             File.WriteAllText(pubFile, "fake content");
             File.WriteAllText(pdfFile, "%PDF-1.4\nExisting");
 
+            // Script renderer to "succeed" but then simulate egress failure
+            // To simulate egress failure, we'll script renderer to NOT create the PDF
+            _renderer.RenderBehaviors.Enqueue(async r => {
+                // Do nothing, hollow render
+                await Task.CompletedTask;
+            });
+
             var options = new ConversionOptions { SourcePath = sourceDir };
             var engine = CreateEngine();
 
@@ -101,8 +128,114 @@ namespace PublisherConverter.Tests
             await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
 
             // Assert
-            Assert.True(File.Exists(pdfFile + ".old"));
-            Assert.Contains("Fake PDF content", File.ReadAllText(pdfFile));
+            Assert.Equal(MigrationStatus.FailedEgress, _manifestWriter.WrittenRecords![0].Status);
+            Assert.True(File.Exists(pdfFile));
+            Assert.Contains("Existing", File.ReadAllText(pdfFile));
+            Assert.False(File.Exists(pdfFile + ".old"));
+        }
+
+        [Fact]
+        public async Task Orchestrator_ShouldHandleHollowRenders()
+        {
+            // Arrange
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceHollow");
+            Directory.CreateDirectory(sourceDir);
+            for (int i = 0; i < 3; i++)
+            {
+                File.WriteAllText(Path.Combine(sourceDir, $"hollow{i}.pub"), "fake content");
+            }
+
+            // Script renderer to "succeed" but write an invalid (0-byte) PDF
+            _renderer.RenderBehaviors.Enqueue(async r => {
+                await File.WriteAllTextAsync(r.LocalPdfPath, "");
+            });
+            _renderer.RenderBehaviors.Enqueue(async r => {
+                await File.WriteAllTextAsync(r.LocalPdfPath, "");
+            });
+            _renderer.RenderBehaviors.Enqueue(async r => {
+                await File.WriteAllTextAsync(r.LocalPdfPath, "");
+            });
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            // Act & Assert
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+            Assert.Contains("Circuit breaker tripped", ex.Message);
+
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.All(_manifestWriter.WrittenRecords.GetRange(0, 3), r => Assert.Equal(MigrationStatus.FailedEgress, r.Status));
+        }
+
+        [Fact]
+        public async Task Orchestrator_ShouldTripBreakerOnHollowRenders()
+        {
+            // Arrange
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceTripHollow");
+            Directory.CreateDirectory(sourceDir);
+            for (int i = 0; i < 5; i++)
+            {
+                File.WriteAllText(Path.Combine(sourceDir, $"hollow{i}.pub"), "fake content");
+            }
+
+            // Script renderer to "succeed" but write an invalid (0-byte) PDF for 3 files
+            // Engine should trip breaker on the 3rd one.
+            for (int i = 0; i < 3; i++)
+            {
+                _renderer.RenderBehaviors.Enqueue(async r => {
+                    await File.WriteAllTextAsync(r.LocalPdfPath, "");
+                });
+            }
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            // Act & Assert
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+            Assert.Contains("Circuit breaker tripped", ex.Message);
+
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.Equal(5, _manifestWriter.WrittenRecords.Count);
+            for (int i = 0; i < 3; i++)
+            {
+                Assert.Equal(MigrationStatus.FailedEgress, _manifestWriter.WrittenRecords[i].Status);
+                Assert.NotEqual(default(DateTime), _manifestWriter.WrittenRecords[i].ProcessedAtUtc);
+            }
+        }
+
+        [Fact]
+        public async Task Orchestrator_ShouldSetProcessedAtUtcOnAllPaths()
+        {
+            // Arrange
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceProcessedAt");
+            Directory.CreateDirectory(sourceDir);
+            File.WriteAllText(Path.Combine(sourceDir, "corrupt.pub"), "not ole"); // Will fail static triage
+            File.WriteAllText(Path.Combine(sourceDir, "breaker.pub"), "fake content"); // Will trip breaker
+
+            _inspector.InspectBehaviors.Enqueue(_ => new FileSafetyStatus { IsCorruptedOrInvalid = true, Reason = "Corrupt" });
+            _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("Tripped"));
+            _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("Tripped retry 1"));
+            _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("Tripped retry 2"));
+            _renderer.MaxConsecutiveFailures = 1; // Trip on first file failure
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            // Act
+            await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+
+            // Assert
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            var corruptRecord = _manifestWriter.WrittenRecords.Find(r => r.FileName == "corrupt.pub");
+            var breakerRecord = _manifestWriter.WrittenRecords.Find(r => r.FileName == "breaker.pub");
+
+            Assert.NotNull(corruptRecord);
+            Assert.NotEqual(default(DateTime), corruptRecord.ProcessedAtUtc);
+            Assert.Equal(MigrationStatus.FailedConversion, corruptRecord.Status);
+
+            Assert.NotNull(breakerRecord);
+            Assert.NotEqual(default(DateTime), breakerRecord.ProcessedAtUtc);
+            Assert.Equal(MigrationStatus.FailedConversion, breakerRecord.Status);
         }
 
         [Fact]

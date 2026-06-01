@@ -9,8 +9,10 @@ namespace PublisherConverter.Tests
 {
     public class FakeFileInspector : IFileInspector
     {
+        public Queue<Func<string, FileSafetyStatus>> InspectBehaviors { get; } = new Queue<Func<string, FileSafetyStatus>>();
         public FileSafetyStatus InspectFile(string filePath)
         {
+            if (InspectBehaviors.Count > 0) return InspectBehaviors.Dequeue()(filePath);
             return new FileSafetyStatus { Reason = "Clean" };
         }
     }
@@ -21,10 +23,11 @@ namespace PublisherConverter.Tests
         public int RecycleCount { get; private set; }
         public int ConsecutiveFailures { get; private set; }
         public int MaxConsecutiveFailures { get; set; } = 3;
+        public bool ShutdownCalled { get; private set; }
         public Queue<Func<FileRecord, Task>> RenderBehaviors { get; } = new Queue<Func<FileRecord, Task>>();
 
         public void Initialize() { }
-        public void Shutdown() { }
+        public void Shutdown() { ShutdownCalled = true; }
 
         public async Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
         {
@@ -32,6 +35,7 @@ namespace PublisherConverter.Tests
             if (RenderBehaviors.Count > 0)
             {
                 await RenderBehaviors.Dequeue()(record);
+                return;
             }
 
             // Default behavior: create a dummy PDF file
@@ -78,9 +82,11 @@ namespace PublisherConverter.Tests
     {
         public string? WrittenDirectory { get; private set; }
         public List<FileRecord>? WrittenRecords { get; private set; }
+        public bool ThrowOnWrite { get; set; }
 
         public void WriteManifest(string directory, List<FileRecord> records)
         {
+            if (ThrowOnWrite) throw new UnauthorizedAccessException("Simulated manifest write failure");
             WrittenDirectory = directory;
             WrittenRecords = new List<FileRecord>(records);
         }

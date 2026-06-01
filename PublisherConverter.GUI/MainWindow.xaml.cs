@@ -62,6 +62,12 @@ namespace PublisherConverter.GUI
                 return;
             }
 
+            if (!int.TryParse(TxtTimeout.Text, out int timeoutSeconds) || timeoutSeconds <= 0)
+            {
+                MessageBox.Show("Please enter a valid positive integer value for the file timeout.", "Configuration Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             // Configure layout interaction lockout bounds
             ToggleUiControls(isRunning: true);
             TxtConsoleLog.Clear();
@@ -98,7 +104,9 @@ namespace PublisherConverter.GUI
                 ArchivePath = TxtArchivePath.Text.Trim(),
                 RunLinkCheck = ChkRunLinkCheck.IsChecked ?? true,
                 DeleteSourceOnSuccess = ChkDeleteSource.IsChecked ?? false,
-                ProcessRecycleInterval = recycleInterval
+                ProcessRecycleInterval = recycleInterval,
+                CompressArchive = ChkCompressArchive.IsChecked ?? true,
+                FileTimeoutSeconds = timeoutSeconds
             };
 
             try
@@ -152,6 +160,8 @@ namespace PublisherConverter.GUI
             ChkRunLinkCheck.IsEnabled = !isRunning;
             ChkDeleteSource.IsEnabled = !isRunning;
             TxtRecycleInterval.IsEnabled = !isRunning;
+            ChkCompressArchive.IsEnabled = !isRunning;
+            TxtTimeout.IsEnabled = !isRunning;
         }
 
         private void AppendConsoleLog(string message)
