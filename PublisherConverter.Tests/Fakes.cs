@@ -96,8 +96,11 @@ namespace PublisherConverter.Tests
     public class FakeProcessLauncher : IProcessLauncher
     {
         public List<FakeProcessHandle> CreatedProcesses { get; } = new List<FakeProcessHandle>();
-        public IProcessHandle StartWorker()
+        public List<string> RequestedPipeNames { get; } = new List<string>();
+
+        public IProcessHandle StartWorker(string pipeName)
         {
+            RequestedPipeNames.Add(pipeName);
             var handle = new FakeProcessHandle(CreatedProcesses.Count + 1);
             CreatedProcesses.Add(handle);
             return handle;

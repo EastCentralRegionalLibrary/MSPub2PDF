@@ -7,6 +7,7 @@ namespace PublisherConverter.Core
     public class PublisherLifecycleManager : IPublisherRenderer
     {
         public const int DefaultMaxConsecutiveFailures = 3;
+        private const int ShutdownTimeoutSeconds = 2;
 
         private int _consecutiveFailureCount = 0;
         private readonly int _maxConsecutiveFailures;
@@ -16,78 +17,69 @@ namespace PublisherConverter.Core
 
         public PublisherLifecycleManager(IPublisherWorkerClient workerClient, int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
         {
-            _workerClient = workerClient;
+            _workerClient = workerClient ?? throw new ArgumentNullException(nameof(workerClient));
             _maxConsecutiveFailures = maxConsecutiveFailures;
         }
 
         /// <summary>
-        /// Creates a PublisherLifecycleManager with default worker infrastructure.
-        /// The worker process will be the current executable (or specified path).
+        /// Creates a PublisherLifecycleManager that launches the current executable
+        /// in worker mode. Use this from the GUI exe (which knows how to handle
+        /// --mode=worker via Program.cs).
         /// </summary>
         public PublisherLifecycleManager(int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
+            : this(workerExecutablePath: null, maxConsecutiveFailures)
         {
-            _maxConsecutiveFailures = maxConsecutiveFailures;
-
-            string pipeName = $"PublisherWorker_{Guid.NewGuid():N}";
-            _workerClient = new PublisherWorkerClient(
-                new ProcessLauncher(pipeName, workerExecutablePath: null),
-                () => new NamedPipeWorkerTransport(pipeName),
-                new DefaultWorkerHealthMonitor(),
-                new DefaultTimeoutProvider(60) // Default 60s
-            );
         }
 
         /// <summary>
-        /// Creates a PublisherLifecycleManager with a specific worker executable path.
+        /// Creates a PublisherLifecycleManager that launches a specified worker
+        /// executable. Pass null to fall back to the current process executable.
         /// </summary>
-        /// <param name="workerExecutablePath">Path to the GUI executable to run as worker</param>
-        /// <param name="maxConsecutiveFailures">Max consecutive failures before circuit breaker</param>
-        private PublisherLifecycleManager(string workerExecutablePath, int maxConsecutiveFailures)
+        public PublisherLifecycleManager(string? workerExecutablePath, int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
         {
             _maxConsecutiveFailures = maxConsecutiveFailures;
 
-            string pipeName = $"PublisherWorker_{Guid.NewGuid():N}";
             _workerClient = new PublisherWorkerClient(
-                new ProcessLauncher(pipeName, workerExecutablePath),
-                () => new NamedPipeWorkerTransport(pipeName),
+                new ProcessLauncher(workerExecutablePath),
+                pipeName => new NamedPipeWorkerTransport(pipeName),
                 new DefaultWorkerHealthMonitor(),
-                new DefaultTimeoutProvider(60)
-            );
+                new DefaultTimeoutProvider(60));
         }
 
         /// <summary>
-        /// Factory method to create a PublisherLifecycleManager with a specific worker executable.
+        /// Factory method for callers that prefer a named factory over the
+        /// nullable-string constructor.
         /// </summary>
         public static PublisherLifecycleManager CreateWithWorkerPath(string workerExecutablePath, int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
         {
+            if (string.IsNullOrEmpty(workerExecutablePath)) throw new ArgumentException("Worker executable path must be provided.", nameof(workerExecutablePath));
             return new PublisherLifecycleManager(workerExecutablePath, maxConsecutiveFailures);
         }
 
         public void Initialize()
         {
-            // Synchronous initialization for backwards compatibility
-            // Warning: This will block the calling thread. Use InitializeAsync() on GUI threads.
-            // Runs on thread pool to avoid blocking if called from GUI context
+            // Blocks the caller until the worker is connected and a health
+            // probe succeeds. Prefer InitializeAsync from GUI threads.
             InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
         }
 
         public async Task InitializeAsync(CancellationToken cancellationToken)
         {
-            // Ensure worker process is started and responsive
             try
             {
-                await _workerClient.EnsureWorkerStartedAsync(cancellationToken);
-                
-                // Send health check to verify worker is operational
-                var request = new WorkerRequest { Command = "health" };
-                var response = await _workerClient.SendRequestAsync(request, null, cancellationToken);
-                
+                await _workerClient.EnsureWorkerStartedAsync(cancellationToken).ConfigureAwait(false);
+
+                var response = await _workerClient.SendRequestAsync(
+                    new WorkerRequest { Command = "health" },
+                    timeoutSeconds: null,
+                    cancellationToken).ConfigureAwait(false);
+
                 if (!response.Success)
                 {
                     throw new InvalidOperationException($"Worker health check failed: {response.ErrorMessage}");
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 lock (_stateLock)
                 {
@@ -99,30 +91,28 @@ namespace PublisherConverter.Core
 
         public void Shutdown()
         {
-            // Graceful shutdown of worker process
             try
             {
-                // Send shutdown request with timeout
-                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                _workerClient.SendRequestAsync(new WorkerRequest { Command = "shutdown" }, 1, cts.Token).Wait(1000);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(ShutdownTimeoutSeconds));
+                _workerClient.SendRequestAsync(
+                    new WorkerRequest { Command = "shutdown" },
+                    timeoutSeconds: ShutdownTimeoutSeconds,
+                    cts.Token).GetAwaiter().GetResult();
             }
             catch
             {
-                // Ignore errors during shutdown
+                // Best-effort graceful shutdown. The Dispose below will
+                // force-terminate the worker if it didn't exit voluntarily.
             }
             finally
             {
-                // Always dispose to ensure worker process is terminated
-                _workerClient?.Dispose();
+                _workerClient.Dispose();
             }
         }
 
         public void Recycle()
         {
-            lock (_stateLock)
-            {
-                _workerClient.RecycleWorker();
-            }
+            _workerClient.RecycleWorker();
         }
 
         public void RecordBatchSuccess()
@@ -163,7 +153,7 @@ namespace PublisherConverter.Core
                 }
             };
 
-            var response = await _workerClient.SendRequestAsync(request, timeoutSeconds, cancellationToken);
+            var response = await _workerClient.SendRequestAsync(request, timeoutSeconds, cancellationToken).ConfigureAwait(false);
 
             if (!response.Success)
             {

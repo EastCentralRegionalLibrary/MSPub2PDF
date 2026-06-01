@@ -23,6 +23,16 @@
 
   <ItemGroup>
     <ProjectReference Include="..\PublisherConverter.Core\PublisherConverter.Core.csproj" />
+    <!--
+      Build-only reference: the integration tests spawn the TestWorker as a
+      real child process, but they locate it on disk rather than calling into
+      its assembly. ReferenceOutputAssembly=false keeps its DLL out of the
+      test bin so xunit doesn't try to scan it for tests.
+    -->
+    <ProjectReference Include="..\PublisherConverter.TestWorker\PublisherConverter.TestWorker.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+    </ProjectReference>
   </ItemGroup>
 
 </Project>
