@@ -13,6 +13,9 @@ namespace PublisherConverter.Core
         private readonly string _pipeName;
         private PipeStream? _stream;
         private readonly bool _isServer;
+        private const int ClientConnectionTimeoutMs = 10000;
+        private const int ConnectionRetryIntervalMs = 100;
+        private const int ConnectionMaxRetriesBeforeTimeout = 100; // ~10 seconds total
 
         public NamedPipeWorkerTransport(string pipeName, bool isServer = false)
         {
@@ -22,17 +25,63 @@ namespace PublisherConverter.Core
 
         public void Connect()
         {
+            // Synchronous version kept for STA thread compatibility in worker host
+            // Prefer ConnectAsync in client code
+            ConnectAsync(CancellationToken.None).GetAwaiter().GetResult();
+        }
+
+        public async Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null)
+        {
             if (_isServer)
             {
                 var serverStream = new NamedPipeServerStream(_pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
-                serverStream.WaitForConnection();
-                _stream = serverStream;
+                try
+                {
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    cts.CancelAfter(timeoutMs ?? 30000); // 30s default for server
+                    await serverStream.WaitForConnectionAsync(cts.Token);
+                    _stream = serverStream;
+                }
+                catch
+                {
+                    serverStream.Dispose();
+                    throw;
+                }
             }
             else
             {
                 var clientStream = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-                clientStream.Connect(10000);
-                _stream = clientStream;
+                try
+                {
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    cts.CancelAfter(timeoutMs ?? ClientConnectionTimeoutMs);
+                    
+                    // Retry with backoff for process startup race condition
+                    int retries = 0;
+                    while (retries < ConnectionMaxRetriesBeforeTimeout)
+                    {
+                        try
+                        {
+                            await clientStream.ConnectAsync(ConnectionRetryIntervalMs, cts.Token);
+                            _stream = clientStream;
+                            return;
+                        }
+                        catch (TimeoutException) when (retries < ConnectionMaxRetriesBeforeTimeout - 1)
+                        {
+                            retries++;
+                            await Task.Delay(ConnectionRetryIntervalMs, cts.Token);
+                        }
+                    }
+                    
+                    // Final attempt - let any exception propagate
+                    await clientStream.ConnectAsync(ConnectionRetryIntervalMs, cts.Token);
+                    _stream = clientStream;
+                }
+                catch
+                {
+                    clientStream.Dispose();
+                    throw;
+                }
             }
         }
 
@@ -100,16 +149,28 @@ namespace PublisherConverter.Core
     public class ProcessLauncher : IProcessLauncher
     {
         private readonly string _pipeName;
+        private readonly string? _workerExecutablePath;
 
-        public ProcessLauncher(string pipeName)
+        /// <summary>
+        /// Creates a ProcessLauncher that spawns the GUI executable as a worker process.
+        /// </summary>
+        /// <param name="pipeName">Named pipe to communicate with worker</param>
+        /// <param name="workerExecutablePath">Path to GUI executable (defaults to current process if null)</param>
+        public ProcessLauncher(string pipeName, string? workerExecutablePath = null)
         {
             _pipeName = pipeName;
+            _workerExecutablePath = workerExecutablePath;
         }
 
         public IProcessHandle StartWorker()
         {
-            string exePath = Process.GetCurrentProcess().MainModule?.FileName
-                             ?? throw new InvalidOperationException("Could not determine current executable path.");
+            string exePath = _workerExecutablePath ?? (Process.GetCurrentProcess().MainModule?.FileName
+                             ?? throw new InvalidOperationException("Could not determine current executable path."));
+
+            if (!File.Exists(exePath))
+            {
+                throw new InvalidOperationException($"Worker executable not found at: {exePath}");
+            }
 
             var startInfo = new ProcessStartInfo(exePath)
             {

@@ -27,6 +27,7 @@ namespace PublisherConverter.Tests
         public Queue<Func<FileRecord, Task>> RenderBehaviors { get; } = new Queue<Func<FileRecord, Task>>();
 
         public void Initialize() { }
+        public async Task InitializeAsync(CancellationToken cancellationToken) { await Task.CompletedTask; }
         public void Shutdown() { ShutdownCalled = true; }
 
         public async Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
@@ -130,6 +131,12 @@ namespace PublisherConverter.Tests
         public bool Disposed { get; private set; }
 
         public void Connect() => Connected = true;
+
+        public Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null)
+        {
+            Connected = true;
+            return Task.CompletedTask;
+        }
 
         public Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken)
         {

@@ -20,54 +20,100 @@ namespace PublisherConverter.Core
             _maxConsecutiveFailures = maxConsecutiveFailures;
         }
 
-        // Default constructor for GUI/backwards compatibility if needed, though we should prefer DI
+        /// <summary>
+        /// Creates a PublisherLifecycleManager with default worker infrastructure.
+        /// The worker process will be the current executable (or specified path).
+        /// </summary>
         public PublisherLifecycleManager(int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
         {
             _maxConsecutiveFailures = maxConsecutiveFailures;
 
             string pipeName = $"PublisherWorker_{Guid.NewGuid():N}";
             _workerClient = new PublisherWorkerClient(
-                new ProcessLauncher(pipeName),
+                new ProcessLauncher(pipeName, workerExecutablePath: null),
                 () => new NamedPipeWorkerTransport(pipeName),
                 new DefaultWorkerHealthMonitor(),
                 new DefaultTimeoutProvider(60) // Default 60s
             );
         }
 
+        /// <summary>
+        /// Creates a PublisherLifecycleManager with a specific worker executable path.
+        /// </summary>
+        /// <param name="workerExecutablePath">Path to the GUI executable to run as worker</param>
+        /// <param name="maxConsecutiveFailures">Max consecutive failures before circuit breaker</param>
+        private PublisherLifecycleManager(string workerExecutablePath, int maxConsecutiveFailures)
+        {
+            _maxConsecutiveFailures = maxConsecutiveFailures;
+
+            string pipeName = $"PublisherWorker_{Guid.NewGuid():N}";
+            _workerClient = new PublisherWorkerClient(
+                new ProcessLauncher(pipeName, workerExecutablePath),
+                () => new NamedPipeWorkerTransport(pipeName),
+                new DefaultWorkerHealthMonitor(),
+                new DefaultTimeoutProvider(60)
+            );
+        }
+
+        /// <summary>
+        /// Factory method to create a PublisherLifecycleManager with a specific worker executable.
+        /// </summary>
+        public static PublisherLifecycleManager CreateWithWorkerPath(string workerExecutablePath, int maxConsecutiveFailures = DefaultMaxConsecutiveFailures)
+        {
+            return new PublisherLifecycleManager(workerExecutablePath, maxConsecutiveFailures);
+        }
+
         public void Initialize()
         {
-            lock (_stateLock)
-            {
-                _workerClient.EnsureWorkerStarted();
+            // Synchronous initialization for backwards compatibility
+            // Warning: This will block the calling thread. Use InitializeAsync() on GUI threads.
+            // Runs on thread pool to avoid blocking if called from GUI context
+            InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
+        }
 
-                // Verify engine availability by sending a health check
-                try
+        public async Task InitializeAsync(CancellationToken cancellationToken)
+        {
+            // Ensure worker process is started and responsive
+            try
+            {
+                await _workerClient.EnsureWorkerStartedAsync(cancellationToken);
+                
+                // Send health check to verify worker is operational
+                var request = new WorkerRequest { Command = "health" };
+                var response = await _workerClient.SendRequestAsync(request, null, cancellationToken);
+                
+                if (!response.Success)
                 {
-                    var response = _workerClient.SendRequestAsync(new WorkerRequest { Command = "health" }, null, CancellationToken.None).GetAwaiter().GetResult();
-                    if (!response.Success)
-                    {
-                        throw new InvalidOperationException($"Worker health check failed: {response.ErrorMessage}");
-                    }
+                    throw new InvalidOperationException($"Worker health check failed: {response.ErrorMessage}");
                 }
-                catch (Exception ex)
+            }
+            catch (Exception ex)
+            {
+                lock (_stateLock)
                 {
                     _consecutiveFailureCount++;
-                    throw new InvalidOperationException($"Inbound worker factory validation failed: {ex.Message}", ex);
                 }
+                throw new InvalidOperationException($"Worker initialization failed: {ex.Message}", ex);
             }
         }
 
         public void Shutdown()
         {
-            lock (_stateLock)
+            // Graceful shutdown of worker process
+            try
             {
-                // Best effort shutdown
-                try
-                {
-                    _workerClient.SendRequestAsync(new WorkerRequest { Command = "shutdown" }, 1, new CancellationTokenSource(1000).Token).Wait();
-                }
-                catch { }
-                _workerClient.Dispose();
+                // Send shutdown request with timeout
+                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                _workerClient.SendRequestAsync(new WorkerRequest { Command = "shutdown" }, 1, cts.Token).Wait(1000);
+            }
+            catch
+            {
+                // Ignore errors during shutdown
+            }
+            finally
+            {
+                // Always dispose to ensure worker process is terminated
+                _workerClient?.Dispose();
             }
         }
 

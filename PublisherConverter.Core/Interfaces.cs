@@ -8,6 +8,7 @@ namespace PublisherConverter.Core
     public interface IPublisherRenderer
     {
         void Initialize();
+        Task InitializeAsync(CancellationToken cancellationToken);
         void Shutdown();
         Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken);
         void Recycle();
@@ -48,6 +49,7 @@ namespace PublisherConverter.Core
     {
         Task<WorkerResponse> SendRequestAsync(WorkerRequest request, int? timeoutSeconds, CancellationToken cancellationToken);
         void EnsureWorkerStarted();
+        Task EnsureWorkerStartedAsync(CancellationToken cancellationToken);
         void RecycleWorker();
         bool IsHealthy { get; }
     }
@@ -57,6 +59,7 @@ namespace PublisherConverter.Core
         Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken);
         Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken);
         void Connect();
+        Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null);
     }
 
     public interface IProcessLauncher

@@ -47,8 +47,8 @@ namespace PublisherConverter.Tests
 
             await Assert.ThrowsAsync<TimeoutException>(() => clientWithSlowTransport.SendRequestAsync(new WorkerRequest { Command = "test" }, null, CancellationToken.None));
 
-            // It starts one, then times out, then recycles (kills first, starts second)
-            Assert.Equal(2, _launcher.CreatedProcesses.Count);
+            // It starts one process and then times out and kills it on error
+            Assert.Single(_launcher.CreatedProcesses);
             Assert.True(_launcher.CreatedProcesses[0].Killed);
         }
 

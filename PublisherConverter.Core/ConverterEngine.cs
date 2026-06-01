@@ -94,7 +94,8 @@ namespace PublisherConverter.Core
                     });
                 }
 
-                _renderer.Initialize();
+                // Initialize renderer asynchronously (non-blocking on GUI thread)
+                await _renderer.InitializeAsync(cancellationToken);
 
                 int successSinceRecycle = 0;
 

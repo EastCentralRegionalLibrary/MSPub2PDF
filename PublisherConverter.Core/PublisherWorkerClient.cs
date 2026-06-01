@@ -32,11 +32,18 @@ namespace PublisherConverter.Core
 
         public void EnsureWorkerStarted()
         {
+            // Synchronous version for backwards compatibility (e.g., PublisherWorkerHost.Run())
+            EnsureWorkerStartedAsync(CancellationToken.None).GetAwaiter().GetResult();
+        }
+
+        public async Task EnsureWorkerStartedAsync(CancellationToken cancellationToken)
+        {
             lock (_lifecycleLock)
             {
                 if (IsHealthy) return;
-                StartNewWorker();
             }
+            
+            await StartNewWorkerAsync(cancellationToken);
         }
 
         public void RecycleWorker()
@@ -44,16 +51,38 @@ namespace PublisherConverter.Core
             lock (_lifecycleLock)
             {
                 TeardownWorker();
-                StartNewWorker();
+            }
+            // Don't await here - let background task handle restart
+        }
+
+        private async Task StartNewWorkerAsync(CancellationToken cancellationToken)
+        {
+            lock (_lifecycleLock)
+            {
+                TeardownWorker();
+                _processHandle = _launcher.StartWorker();
+                _transport = _transportFactory();
+            }
+
+            // Connect outside the lock to avoid blocking other operations
+            try
+            {
+                await _transport.ConnectAsync(cancellationToken, timeoutMs: 30000);
+            }
+            catch (Exception ex)
+            {
+                lock (_lifecycleLock)
+                {
+                    TeardownWorker();
+                }
+                throw new InvalidOperationException($"Failed to connect to worker process: {ex.Message}", ex);
             }
         }
 
         private void StartNewWorker()
         {
-            TeardownWorker();
-            _processHandle = _launcher.StartWorker();
-            _transport = _transportFactory();
-            _transport.Connect();
+            // Synchronous wrapper for backwards compatibility
+            StartNewWorkerAsync(CancellationToken.None).GetAwaiter().GetResult();
         }
 
         private void TeardownWorker()
@@ -74,7 +103,7 @@ namespace PublisherConverter.Core
             await _ipcSemaphore.WaitAsync(cancellationToken);
             try
             {
-                EnsureWorkerStarted();
+                await EnsureWorkerStartedAsync(cancellationToken);
 
                 TimeSpan timeout = timeoutSeconds.HasValue
                     ? TimeSpan.FromSeconds(timeoutSeconds.Value)
@@ -97,12 +126,18 @@ namespace PublisherConverter.Core
                 }
                 catch (OperationCanceledException) when (cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
-                    RecycleWorker();
+                    lock (_lifecycleLock)
+                    {
+                        TeardownWorker();
+                    }
                     throw new TimeoutException($"Worker request timed out after {timeout.TotalSeconds}s.");
                 }
                 catch (Exception)
                 {
-                    RecycleWorker();
+                    lock (_lifecycleLock)
+                    {
+                        TeardownWorker();
+                    }
                     throw;
                 }
             }
@@ -114,7 +149,10 @@ namespace PublisherConverter.Core
 
         public void Dispose()
         {
-            TeardownWorker();
+            lock (_lifecycleLock)
+            {
+                TeardownWorker();
+            }
             _ipcSemaphore.Dispose();
         }
     }
