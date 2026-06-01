@@ -43,4 +43,42 @@ namespace PublisherConverter.Core
     {
         void WriteManifest(string directory, List<FileRecord> records);
     }
+
+    public interface IPublisherWorkerClient : IDisposable
+    {
+        Task<WorkerResponse> SendRequestAsync(WorkerRequest request, int? timeoutSeconds, CancellationToken cancellationToken);
+        void EnsureWorkerStarted();
+        void RecycleWorker();
+        bool IsHealthy { get; }
+    }
+
+    public interface IWorkerTransport : IDisposable
+    {
+        Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken);
+        Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken);
+        void Connect();
+    }
+
+    public interface IProcessLauncher
+    {
+        IProcessHandle StartWorker();
+    }
+
+    public interface IProcessHandle : IDisposable
+    {
+        int Id { get; }
+        bool HasExited { get; }
+        void Kill();
+        event EventHandler Exited;
+    }
+
+    public interface IWorkerHealthMonitor
+    {
+        bool IsProcessHealthy(IProcessHandle? handle);
+    }
+
+    public interface ITimeoutProvider
+    {
+        TimeSpan GetTimeout(string command);
+    }
 }
