@@ -219,6 +219,36 @@ namespace PublisherConverter.Tests
         }
 
         [Fact]
+        public async Task EngineCrashAbortsRenderWithoutWaitingForTimeout()
+        {
+            // The "engine-crash" scenario simulates Publisher dying mid-render
+            // while the synchronous COM call is still blocked. The worker host
+            // must detect this and force-exit so the client doesn't sit on a
+            // dead pipe until its request timeout (10s here) fires.
+            var client = CreateClient(scenario: "engine-crash");
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                client.SendRequestAsync(new WorkerRequest
+                {
+                    Command = "render",
+                    RenderJob = new RenderJob
+                    {
+                        SourcePubPath = Path.Combine(_workspaceDir, "x.pub"),
+                        TargetPdfPath = Path.Combine(_workspaceDir, "x.pdf"),
+                    }
+                }, timeoutSeconds: 10, CancellationToken.None));
+            sw.Stop();
+
+            Assert.True(
+                sw.Elapsed < TimeSpan.FromSeconds(3),
+                $"Engine crash should be detected within ~1s but took {sw.Elapsed.TotalSeconds:F2}s.");
+
+            await WaitUntilUnhealthyAsync(client, TimeSpan.FromSeconds(3));
+            Assert.False(client.IsHealthy);
+        }
+
+        [Fact]
         public async Task WorkerCrashMidJobSurfacesAsException()
         {
             var client = CreateClient(scenario: "crash-on-render");
