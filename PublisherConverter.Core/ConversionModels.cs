@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace PublisherConverter.Core
 {
@@ -11,6 +12,26 @@ namespace PublisherConverter.Core
         FailedIngress,
         FailedConversion,
         FailedEgress
+    }
+
+    /// <summary>
+    /// Thrown by ConverterEngine when too many consecutive files fail and the
+    /// circuit breaker halts the batch. Derives from InvalidOperationException
+    /// for backwards compatibility with existing catch blocks. Callers (the GUI)
+    /// can catch this specifically to offer the user a "Continue" option that
+    /// re-runs while skipping the already-attempted files.
+    /// </summary>
+    public class CircuitBreakerTrippedException : InvalidOperationException
+    {
+        public int ConsecutiveFailures { get; }
+        public IReadOnlyList<string> AttemptedSourcePaths { get; }
+
+        public CircuitBreakerTrippedException(int consecutiveFailures, IReadOnlyList<string> attemptedSourcePaths)
+            : base($"Circuit breaker tripped after {consecutiveFailures} consecutive failures. Aborting batch.")
+        {
+            ConsecutiveFailures = consecutiveFailures;
+            AttemptedSourcePaths = attemptedSourcePaths;
+        }
     }
 
     public class FileRecord
@@ -55,5 +76,13 @@ namespace PublisherConverter.Core
         public bool DeleteSourceOnSuccess { get; set; } = false;
         public int ProcessRecycleInterval { get; set; } = 50;
         public int FileTimeoutSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// Absolute source paths to skip during discovery. The GUI's "Continue"
+        /// flow populates this with files attempted in a prior run so resuming
+        /// after a circuit-breaker trip processes only the remaining work.
+        /// Case-insensitive matching is recommended for Windows path semantics.
+        /// </summary>
+        public HashSet<string>? SkipSourcePaths { get; set; }
     }
 }

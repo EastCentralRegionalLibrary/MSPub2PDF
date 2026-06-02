@@ -288,6 +288,41 @@ namespace PublisherConverter.Tests
         }
 
         [Fact]
+        public async Task LifecycleManagerWithFactoryIsReusableAfterShutdown()
+        {
+            // Simulates the GUI's "Continue" flow: after a run ends (and the
+            // engine calls Shutdown in its finally block), the same
+            // PublisherLifecycleManager reference must remain functional so
+            // re-running doesn't require rewiring the engine.
+            string workerExe = TestWorkerLocator.GetExecutable();
+            var manager = new PublisherLifecycleManager(workerExe);
+
+            try
+            {
+                await manager.InitializeAsync(CancellationToken.None);
+                manager.Shutdown();
+
+                // Second pass — same manager instance, fresh worker process.
+                await manager.InitializeAsync(CancellationToken.None);
+                var record = new FileRecord { FileName = "reuse.pub" };
+                string targetPath = Path.Combine(_workspaceDir, "reuse.pdf");
+                await manager.ExecuteRenderingJobAsync(
+                    record,
+                    Path.Combine(_workspaceDir, "reuse.pub"),
+                    targetPath,
+                    runLinkCheck: false,
+                    timeoutSeconds: DefaultRequestTimeoutSeconds,
+                    CancellationToken.None);
+
+                Assert.True(File.Exists(targetPath));
+            }
+            finally
+            {
+                manager.Shutdown();
+            }
+        }
+
+        [Fact]
         public async Task LifecycleManagerExecuteRenderingJobPropagatesResult()
         {
             var client = CreateClient();
