@@ -317,6 +317,46 @@ namespace PublisherConverter.Tests
             Assert.True(client.Disposed);
         }
 
+        [Fact]
+        public void LifecycleManager_ShutdownResetsConsecutiveFailureCount()
+        {
+            // After a circuit-breaker trip, Shutdown is called and the failure
+            // counter should clear so a follow-up "Continue" run starts fresh.
+            var manager = new PublisherLifecycleManager(new FakePublisherWorkerClient(), maxConsecutiveFailures: 3);
+
+            manager.RecordBatchFailure();
+            manager.RecordBatchFailure();
+            Assert.Equal(2, manager.ConsecutiveFailures);
+
+            manager.Shutdown();
+
+            Assert.Equal(0, manager.ConsecutiveFailures);
+        }
+
+        [Fact]
+        public async Task LifecycleManager_DiCtorAfterShutdownThrowsClearErrorOnReuse()
+        {
+            // The DI-constructed manager has no factory to rebuild from. A
+            // re-use after Shutdown must surface a clear InvalidOperationException
+            // rather than an ObjectDisposedException leaking from the disposed
+            // client.
+            var client = new FakePublisherWorkerClient();
+            var manager = new PublisherLifecycleManager(client);
+
+            manager.Shutdown();
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                manager.ExecuteRenderingJobAsync(
+                    new FileRecord { FileName = "x.pub" },
+                    "/tmp/x.pub",
+                    "/tmp/x.pdf",
+                    runLinkCheck: false,
+                    timeoutSeconds: 5,
+                    CancellationToken.None));
+
+            Assert.Contains("disposed", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+
         // -----------------------------
         // Local test doubles
         // -----------------------------

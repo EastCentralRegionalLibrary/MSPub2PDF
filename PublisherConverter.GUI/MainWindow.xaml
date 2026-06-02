@@ -166,6 +166,16 @@
                         FontWeight="Bold"
                         IsEnabled="False"
                         Click="BtnCancel_Click"/>
+                <Button x:Name="BtnContinue"
+                        Content="Continue (Skip Attempted)"
+                        Width="180"
+                        Height="32"
+                        Margin="10,0,0,0"
+                        Background="#0D47A1"
+                        Foreground="White"
+                        FontWeight="Bold"
+                        Visibility="Collapsed"
+                        Click="BtnContinue_Click"/>
             </StackPanel>
         </Grid>
 

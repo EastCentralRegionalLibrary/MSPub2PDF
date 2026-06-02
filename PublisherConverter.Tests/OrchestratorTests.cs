@@ -160,7 +160,7 @@ namespace PublisherConverter.Tests
             var engine = CreateEngine();
 
             // Act & Assert
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
             Assert.Contains("Circuit breaker tripped", ex.Message);
 
             Assert.NotNull(_manifestWriter.WrittenRecords);
@@ -191,7 +191,7 @@ namespace PublisherConverter.Tests
             var engine = CreateEngine();
 
             // Act & Assert
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
             Assert.Contains("Circuit breaker tripped", ex.Message);
 
             Assert.NotNull(_manifestWriter.WrittenRecords);
@@ -222,7 +222,7 @@ namespace PublisherConverter.Tests
             var engine = CreateEngine();
 
             // Act
-            await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+            await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
 
             // Assert
             Assert.NotNull(_manifestWriter.WrittenRecords);
@@ -263,7 +263,7 @@ namespace PublisherConverter.Tests
             var engine = CreateEngine();
 
             // Act & Assert
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() => engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
             Assert.Contains("Circuit breaker tripped", ex.Message);
 
             Assert.Equal(9, _renderer.RenderCount); // 3 files * 3 attempts
@@ -280,6 +280,103 @@ namespace PublisherConverter.Tests
             {
                 Assert.Equal(MigrationStatus.Pending, _manifestWriter.WrittenRecords[i].Status);
             }
+        }
+
+        [Fact]
+        public async Task Orchestrator_ShouldSkipFilesInSkipSourcePaths()
+        {
+            // Arrange
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceSkip");
+            Directory.CreateDirectory(sourceDir);
+            string keptPath = Path.Combine(sourceDir, "keep.pub");
+            string skippedPath = Path.Combine(sourceDir, "skip.pub");
+            File.WriteAllText(keptPath, "fake content");
+            File.WriteAllText(skippedPath, "fake content");
+
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                SkipSourcePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { skippedPath }
+            };
+            var engine = CreateEngine();
+
+            // Act
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            // Assert
+            Assert.Equal(1, _renderer.RenderCount);
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.Single(_manifestWriter.WrittenRecords);
+            Assert.Equal("keep.pub", _manifestWriter.WrittenRecords[0].FileName);
+        }
+
+        [Fact]
+        public async Task Orchestrator_CircuitBreakerExceptionExposesAttemptedPaths()
+        {
+            // Arrange — 5 files, force the breaker to trip on the 3rd file.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceBreakerPaths");
+            Directory.CreateDirectory(sourceDir);
+            for (int i = 0; i < 5; i++)
+            {
+                File.WriteAllText(Path.Combine(sourceDir, $"f{i}.pub"), "fake content");
+            }
+            for (int i = 0; i < 3; i++)
+            {
+                for (int j = 0; j < 3; j++)
+                {
+                    _renderer.RenderBehaviors.Enqueue(_ => throw new Exception($"Fail {i}/{j}"));
+                }
+            }
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            // Act & Assert
+            var ex = await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() =>
+                engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None));
+
+            Assert.Equal(3, ex.ConsecutiveFailures);
+            Assert.Equal(3, ex.AttemptedSourcePaths.Count);
+            foreach (var p in ex.AttemptedSourcePaths)
+            {
+                Assert.StartsWith(sourceDir, p);
+            }
+        }
+
+        [Fact]
+        public async Task Orchestrator_ResumingWithSkipPathsProcessesOnlyRemainingFiles()
+        {
+            // Arrange — simulate "continue after circuit breaker". First run
+            // trips after 3 failures; second run skips those 3 and processes
+            // the remaining 2 successfully.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceResume");
+            Directory.CreateDirectory(sourceDir);
+            for (int i = 0; i < 5; i++)
+            {
+                File.WriteAllText(Path.Combine(sourceDir, $"f{i}.pub"), "fake content");
+            }
+            for (int i = 0; i < 9; i++) // 3 files × 3 retries
+            {
+                _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("first run failure"));
+            }
+
+            var firstOptions = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+            var ex = await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() =>
+                engine.ExecuteMigrationAsync(firstOptions, new FakeProgressReporter(), CancellationToken.None));
+
+            // Act — second pass with the attempted paths as the skip list.
+            var secondOptions = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                SkipSourcePaths = new HashSet<string>(ex.AttemptedSourcePaths, StringComparer.OrdinalIgnoreCase)
+            };
+            await engine.ExecuteMigrationAsync(secondOptions, new FakeProgressReporter(), CancellationToken.None);
+
+            // Assert
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.Equal(2, _manifestWriter.WrittenRecords.Count);
+            Assert.All(_manifestWriter.WrittenRecords, r => Assert.Equal(MigrationStatus.VerifiedComplete, r.Status));
         }
 
         private class FakeProgressReporter : IProgressReporter

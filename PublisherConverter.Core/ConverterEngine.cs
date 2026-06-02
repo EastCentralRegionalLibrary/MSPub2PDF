@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -65,6 +66,18 @@ namespace PublisherConverter.Core
                 if (!string.IsNullOrEmpty(options.ManifestOutputPath) && !IsDirectoryWritable(options.ManifestOutputPath)) throw new UnauthorizedAccessException($"Manifest output directory is not writable: {options.ManifestOutputPath}");
 
                 var files = FindPubFiles(options.SourcePath);
+
+                if (options.SkipSourcePaths != null && options.SkipSourcePaths.Count > 0)
+                {
+                    int beforeCount = files.Count;
+                    files = files.Where(f => !options.SkipSourcePaths.Contains(f)).ToList();
+                    int skipped = beforeCount - files.Count;
+                    if (skipped > 0)
+                    {
+                        reporter.Report(UpdateProgressState(report, $"Resuming — skipped {skipped} previously attempted file(s).", null));
+                    }
+                }
+
                 report.TotalFiles = files.Count;
 
                 if (report.TotalFiles == 0)
@@ -213,7 +226,7 @@ namespace PublisherConverter.Core
                         record.ProcessedAtUtc = DateTime.UtcNow;
                         if (tripBreaker)
                         {
-                            throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
+                            throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
                         }
                     }
 
@@ -262,7 +275,7 @@ namespace PublisherConverter.Core
 
                                 bool tripBreaker = _renderer.RecordBatchFailure();
                                 record.ProcessedAtUtc = DateTime.UtcNow;
-                                if (tripBreaker) throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
+                                if (tripBreaker) throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
                             }
                         }
                         catch (Exception ex)
@@ -277,7 +290,7 @@ namespace PublisherConverter.Core
 
                             bool tripBreaker = _renderer.RecordBatchFailure();
                             record.ProcessedAtUtc = DateTime.UtcNow;
-                            if (tripBreaker) throw new InvalidOperationException($"Circuit breaker tripped after {_renderer.ConsecutiveFailures} consecutive failures. Aborting batch.");
+                            if (tripBreaker) throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
                         }
                     }
 
@@ -342,6 +355,19 @@ namespace PublisherConverter.Core
 
                 try { archiveService?.Dispose(); } catch { }
             }
+        }
+
+        private static List<string> CollectAttemptedSourcePaths(List<FileRecord> indexed)
+        {
+            var attempted = new List<string>(indexed.Count);
+            foreach (var r in indexed)
+            {
+                if (r.Status != MigrationStatus.Pending && !string.IsNullOrEmpty(r.OriginalFullPath))
+                {
+                    attempted.Add(r.OriginalFullPath);
+                }
+            }
+            return attempted;
         }
 
         public static List<string> FindPubFiles(string root)
