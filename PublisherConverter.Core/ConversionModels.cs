@@ -74,7 +74,24 @@ namespace PublisherConverter.Core
         public string? ManifestOutputPath { get; set; }
         public bool CompressArchive { get; set; } = false;
         public bool DeleteSourceOnSuccess { get; set; } = false;
+
+        /// <summary>
+        /// When true, the worker process is recycled (restarted) every
+        /// <see cref="ProcessRecycleInterval"/> successfully converted files to
+        /// keep COM/Publisher memory in check. Disabled by default.
+        /// </summary>
+        public bool EnableProcessRecycle { get; set; } = false;
         public int ProcessRecycleInterval { get; set; } = 50;
+
+        /// <summary>
+        /// When true, the batch halts (throwing <see cref="CircuitBreakerTrippedException"/>)
+        /// once <see cref="MaxConsecutiveFailures"/> files fail back-to-back. The GUI
+        /// then offers a "Continue" option. Disabled by default — failures are
+        /// recorded per-file and the run proceeds through the whole set.
+        /// </summary>
+        public bool EnableCircuitBreaker { get; set; } = false;
+        public int MaxConsecutiveFailures { get; set; } = 3;
+
         public int FileTimeoutSeconds { get; set; } = 60;
 
         /// <summary>

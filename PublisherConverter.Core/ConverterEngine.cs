@@ -120,7 +120,7 @@ namespace PublisherConverter.Core
                         throw new OperationCanceledException(cancellationToken);
                     }
 
-                    if (options.ProcessRecycleInterval > 0 && successSinceRecycle >= options.ProcessRecycleInterval)
+                    if (options.EnableProcessRecycle && options.ProcessRecycleInterval > 0 && successSinceRecycle >= options.ProcessRecycleInterval)
                     {
                         _renderer.Recycle();
                         successSinceRecycle = 0;
@@ -216,7 +216,7 @@ namespace PublisherConverter.Core
                     {
                         // The file has completely exhausted all 3 local retries. Record a batch strike.
                         // If 3 completely different files do this back-to-back, this call trips the circuit breaker and stops the run.
-                        bool tripBreaker = _renderer.RecordBatchFailure();
+                        _renderer.RecordBatchFailure();
 
                         record.Status = MigrationStatus.FailedConversion;
                         record.Details = lastRenderingException is TimeoutException
@@ -224,7 +224,7 @@ namespace PublisherConverter.Core
                             : $"COM Rendering Exception: {lastRenderingException?.Message.Trim()} (Exhausted {maxFileAttempts} attempts).";
 
                         record.ProcessedAtUtc = DateTime.UtcNow;
-                        if (tripBreaker)
+                        if (CircuitBreakerTripped(options))
                         {
                             throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
                         }
@@ -273,12 +273,15 @@ namespace PublisherConverter.Core
 
                                 if (backupPath != null && File.Exists(backupPath)) File.Move(backupPath, record.FinalPdfPath, true);
 
-                                bool tripBreaker = _renderer.RecordBatchFailure();
+                                _renderer.RecordBatchFailure();
                                 record.ProcessedAtUtc = DateTime.UtcNow;
-                                if (tripBreaker) throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
+                                if (CircuitBreakerTripped(options)) throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
                             }
                         }
-                        catch (Exception ex)
+                        // A circuit-breaker trip raised by the hollow-PDF branch above
+                        // must propagate, not be re-handled here as an egress save
+                        // failure (which would double-count the strike).
+                        catch (Exception ex) when (ex is not CircuitBreakerTrippedException)
                         {
                             record.Status = MigrationStatus.FailedEgress;
                             record.Details = $"Egress Save Failure: {ex.Message}";
@@ -288,9 +291,9 @@ namespace PublisherConverter.Core
                                 try { File.Move(backupPath, record.FinalPdfPath, true); } catch { }
                             }
 
-                            bool tripBreaker = _renderer.RecordBatchFailure();
+                            _renderer.RecordBatchFailure();
                             record.ProcessedAtUtc = DateTime.UtcNow;
-                            if (tripBreaker) throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
+                            if (CircuitBreakerTripped(options)) throw new CircuitBreakerTrippedException(_renderer.ConsecutiveFailures, CollectAttemptedSourcePaths(indexedFiles));
                         }
                     }
 
@@ -355,6 +358,13 @@ namespace PublisherConverter.Core
 
                 try { archiveService?.Dispose(); } catch { }
             }
+        }
+
+        private bool CircuitBreakerTripped(ConversionOptions options)
+        {
+            return options.EnableCircuitBreaker
+                && options.MaxConsecutiveFailures > 0
+                && _renderer.ConsecutiveFailures >= options.MaxConsecutiveFailures;
         }
 
         private static List<string> CollectAttemptedSourcePaths(List<FileRecord> indexed)
