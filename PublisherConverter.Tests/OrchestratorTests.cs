@@ -93,7 +93,7 @@ namespace PublisherConverter.Tests
                 File.WriteAllText(Path.Combine(sourceDir, $"test{i}.pub"), "fake content");
             }
 
-            var options = new ConversionOptions { SourcePath = sourceDir, ProcessRecycleInterval = 2 };
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableProcessRecycle = true, ProcessRecycleInterval = 2 };
             var engine = CreateEngine();
 
             // Act
@@ -156,7 +156,7 @@ namespace PublisherConverter.Tests
                 await File.WriteAllTextAsync(r.LocalPdfPath, "");
             });
 
-            var options = new ConversionOptions { SourcePath = sourceDir };
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = true, MaxConsecutiveFailures = 3 };
             var engine = CreateEngine();
 
             // Act & Assert
@@ -187,7 +187,7 @@ namespace PublisherConverter.Tests
                 });
             }
 
-            var options = new ConversionOptions { SourcePath = sourceDir };
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = true, MaxConsecutiveFailures = 3 };
             var engine = CreateEngine();
 
             // Act & Assert
@@ -218,7 +218,7 @@ namespace PublisherConverter.Tests
             _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("Tripped retry 2"));
             _renderer.MaxConsecutiveFailures = 1; // Trip on first file failure
 
-            var options = new ConversionOptions { SourcePath = sourceDir };
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = true, MaxConsecutiveFailures = 1 };
             var engine = CreateEngine();
 
             // Act
@@ -259,7 +259,7 @@ namespace PublisherConverter.Tests
                 }
             }
 
-            var options = new ConversionOptions { SourcePath = sourceDir };
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = true, MaxConsecutiveFailures = 3 };
             var engine = CreateEngine();
 
             // Act & Assert
@@ -328,7 +328,7 @@ namespace PublisherConverter.Tests
                 }
             }
 
-            var options = new ConversionOptions { SourcePath = sourceDir };
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = true, MaxConsecutiveFailures = 3 };
             var engine = CreateEngine();
 
             // Act & Assert
@@ -360,7 +360,7 @@ namespace PublisherConverter.Tests
                 _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("first run failure"));
             }
 
-            var firstOptions = new ConversionOptions { SourcePath = sourceDir };
+            var firstOptions = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = true, MaxConsecutiveFailures = 3 };
             var engine = CreateEngine();
             var ex = await Assert.ThrowsAsync<CircuitBreakerTrippedException>(() =>
                 engine.ExecuteMigrationAsync(firstOptions, new FakeProgressReporter(), CancellationToken.None));
@@ -369,6 +369,8 @@ namespace PublisherConverter.Tests
             var secondOptions = new ConversionOptions
             {
                 SourcePath = sourceDir,
+                EnableCircuitBreaker = true,
+                MaxConsecutiveFailures = 3,
                 SkipSourcePaths = new HashSet<string>(ex.AttemptedSourcePaths, StringComparer.OrdinalIgnoreCase)
             };
             await engine.ExecuteMigrationAsync(secondOptions, new FakeProgressReporter(), CancellationToken.None);
@@ -377,6 +379,58 @@ namespace PublisherConverter.Tests
             Assert.NotNull(_manifestWriter.WrittenRecords);
             Assert.Equal(2, _manifestWriter.WrittenRecords.Count);
             Assert.All(_manifestWriter.WrittenRecords, r => Assert.Equal(MigrationStatus.VerifiedComplete, r.Status));
+        }
+
+        [Fact]
+        public async Task Orchestrator_DisabledCircuitBreaker_ProcessesAllFilesWithoutHalting()
+        {
+            // Arrange — 5 files that all fail rendering. With the breaker
+            // disabled (the default), the run must NOT halt; every file should
+            // be attempted and recorded as failed.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceNoBreaker");
+            Directory.CreateDirectory(sourceDir);
+            for (int i = 0; i < 5; i++)
+            {
+                File.WriteAllText(Path.Combine(sourceDir, $"f{i}.pub"), "fake content");
+            }
+            for (int i = 0; i < 15; i++) // 5 files × 3 retries
+            {
+                _renderer.RenderBehaviors.Enqueue(_ => throw new Exception("always fails"));
+            }
+
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableCircuitBreaker = false };
+            var engine = CreateEngine();
+
+            // Act — should complete without throwing.
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            // Assert
+            Assert.Equal(15, _renderer.RenderCount);
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.Equal(5, _manifestWriter.WrittenRecords.Count);
+            Assert.All(_manifestWriter.WrittenRecords, r => Assert.Equal(MigrationStatus.FailedConversion, r.Status));
+        }
+
+        [Fact]
+        public async Task Orchestrator_DisabledRecycle_DoesNotRecycleEvenPastInterval()
+        {
+            // Arrange — 5 files that convert fine, recycle interval of 2 but
+            // recycling disabled (the default). The engine must never recycle.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SourceNoRecycle");
+            Directory.CreateDirectory(sourceDir);
+            for (int i = 0; i < 5; i++)
+            {
+                File.WriteAllText(Path.Combine(sourceDir, $"f{i}.pub"), "fake content");
+            }
+
+            var options = new ConversionOptions { SourcePath = sourceDir, EnableProcessRecycle = false, ProcessRecycleInterval = 2 };
+            var engine = CreateEngine();
+
+            // Act
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            // Assert
+            Assert.Equal(0, _renderer.RecycleCount);
         }
 
         private class FakeProgressReporter : IProgressReporter

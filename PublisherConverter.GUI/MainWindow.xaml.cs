@@ -77,9 +77,19 @@ namespace PublisherConverter.GUI
                 return;
             }
 
-            if (!int.TryParse(TxtRecycleInterval.Text, out int recycleInterval) || recycleInterval <= 0)
+            bool enableRecycle = ChkEnableRecycle.IsChecked ?? false;
+            int recycleInterval = 0;
+            if (enableRecycle && (!int.TryParse(TxtRecycleInterval.Text, out recycleInterval) || recycleInterval <= 0))
             {
                 MessageBox.Show("Please enter a valid positive integer value for the engine recycle limit.", "Configuration Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            bool enableCircuitBreaker = ChkEnableCircuitBreaker.IsChecked ?? false;
+            int maxFailures = 0;
+            if (enableCircuitBreaker && (!int.TryParse(TxtMaxFailures.Text, out maxFailures) || maxFailures <= 0))
+            {
+                MessageBox.Show("Please enter a valid positive integer value for the circuit breaker failure threshold.", "Configuration Error", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -129,7 +139,10 @@ namespace PublisherConverter.GUI
                 ArchivePath = TxtArchivePath.Text.Trim(),
                 RunLinkCheck = ChkRunLinkCheck.IsChecked ?? true,
                 DeleteSourceOnSuccess = ChkDeleteSource.IsChecked ?? false,
+                EnableProcessRecycle = enableRecycle,
                 ProcessRecycleInterval = recycleInterval,
+                EnableCircuitBreaker = enableCircuitBreaker,
+                MaxConsecutiveFailures = maxFailures,
                 CompressArchive = ChkCompressArchive.IsChecked ?? true,
                 FileTimeoutSeconds = timeoutSeconds,
                 SkipSourcePaths = resuming ? new HashSet<string>(_attemptedSourcePaths, StringComparer.OrdinalIgnoreCase) : null
@@ -207,7 +220,10 @@ namespace PublisherConverter.GUI
             BtnBrowseArchive.IsEnabled = !isRunning;
             ChkRunLinkCheck.IsEnabled = !isRunning;
             ChkDeleteSource.IsEnabled = !isRunning;
+            ChkEnableRecycle.IsEnabled = !isRunning;
             TxtRecycleInterval.IsEnabled = !isRunning;
+            ChkEnableCircuitBreaker.IsEnabled = !isRunning;
+            TxtMaxFailures.IsEnabled = !isRunning;
             ChkCompressArchive.IsEnabled = !isRunning;
             TxtTimeout.IsEnabled = !isRunning;
         }
