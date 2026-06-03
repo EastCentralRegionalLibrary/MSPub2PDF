@@ -172,37 +172,94 @@ namespace PublisherConverter.Core
                         continue;
                     }
 
+                    // Per-document fallback strategy. State resets on each new
+                    // document so a degradation applied here doesn't bleed into
+                    // the next file.
+                    //   - Export error → step Intent down one rung (Commercial
+                    //     → Printing → Standard); record gets a _printres /
+                    //     _standardres suffix on the output filename.
+                    //   - Publisher crash → after the first two attempts,
+                    //     turn DocStructureTags off; output gets _notags.
+                    //   - Timeout → retry as-is (no parameter change).
                     const int maxFileAttempts = 3;
                     bool renderingSucceeded = false;
                     Exception? lastRenderingException = null;
 
-                    // Intra-File Local Retry Loop
+                    RenderIntent currentIntent = RenderIntent.Commercial;
+                    bool docStructureTags = true;
+                    bool hadEngineCrash = false;
+                    string baseLocalPdfPath = record.LocalPdfPath;
+                    string baseFinalPdfPath = record.FinalPdfPath;
+
                     for (int attempt = 1; attempt <= maxFileAttempts; attempt++)
                     {
                         if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken);
 
+                        string suffix = ComputeFallbackSuffix(currentIntent, docStructureTags);
+                        string thisLocalPdfPath = ApplyPdfSuffix(baseLocalPdfPath, suffix);
+                        string thisFinalPdfPath = ApplyPdfSuffix(baseFinalPdfPath, suffix);
+
                         string attemptPrefix = attempt > 1 ? $"[Retry {attempt}/{maxFileAttempts}] " : "";
-                        reporter.Report(UpdateProgressState(report, $"{attemptPrefix}Processing: {record.FileName}", record));
+                        string statusMsg = string.IsNullOrEmpty(suffix)
+                            ? $"{attemptPrefix}Processing: {record.FileName}"
+                            : $"{attemptPrefix}Processing {record.FileName} with degraded settings (intent={currentIntent}, tags={(docStructureTags ? "on" : "off")}) → {Path.GetFileName(thisLocalPdfPath)}";
+                        reporter.Report(UpdateProgressState(report, statusMsg, record));
 
                         try
                         {
-                            await _renderer.ExecuteRenderingJobAsync(record, record.LocalPubPath, record.LocalPdfPath, options.RunLinkCheck, options.FileTimeoutSeconds, cancellationToken);
+                            await _renderer.ExecuteRenderingJobAsync(
+                                record,
+                                record.LocalPubPath,
+                                thisLocalPdfPath,
+                                options.RunLinkCheck,
+                                currentIntent,
+                                docStructureTags,
+                                options.FileTimeoutSeconds,
+                                cancellationToken);
+
                             renderingSucceeded = true;
+                            record.LocalPdfPath = thisLocalPdfPath;
+                            record.FinalPdfPath = thisFinalPdfPath;
                             break;
                         }
                         catch (OperationCanceledException)
                         {
                             throw;
                         }
+                        catch (TimeoutException ex)
+                        {
+                            lastRenderingException = ex;
+                            record.HadFailedAttempt = true;
+                            record.Details = $"Attempt {attempt} timed out — retrying with the same settings.";
+                            // No parameter change: timeouts retry as-is per spec.
+                        }
+                        catch (RenderEngineCrashException ex)
+                        {
+                            lastRenderingException = ex;
+                            record.HadFailedAttempt = true;
+                            hadEngineCrash = true;
+                            record.Details = $"Attempt {attempt}: Publisher engine crashed during export.";
+                        }
+                        catch (RenderExportFailureException ex)
+                        {
+                            lastRenderingException = ex;
+                            record.HadFailedAttempt = true;
+                            record.Details = $"Attempt {attempt}: export failed — {ex.Message.Trim()}";
+                            currentIntent = NextLowerIntent(currentIntent);
+                        }
                         catch (Exception ex)
                         {
                             lastRenderingException = ex;
+                            record.HadFailedAttempt = true;
+                            record.Details = $"Attempt {attempt}: {ex.GetType().Name} — {ex.Message.Trim()}";
+                            currentIntent = NextLowerIntent(currentIntent);
+                        }
 
-                            if (attempt < maxFileAttempts)
-                            {
-                                record.Details = $"Attempt {attempt} thrown out ({ex.GetType().Name}). Accessing local retry block...";
-                                continue;
-                            }
+                        // After two attempts, if we've seen a crash, drop the
+                        // accessibility tags for the next try.
+                        if (hadEngineCrash && attempt >= 2 && docStructureTags)
+                        {
+                            docStructureTags = false;
                         }
                     }
 
@@ -325,7 +382,13 @@ namespace PublisherConverter.Core
                     reporter.Report(UpdateProgressState(report, "Deleting successfully converted source files...", null));
                     foreach (var record in indexedFiles)
                     {
-                        if (record.Status == MigrationStatus.VerifiedComplete && IsPlausiblePdf(record.FinalPdfPath))
+                        // Only delete originals that converted cleanly on the
+                        // first try with no retries. Anything that had a
+                        // failed attempt (including degraded successes) stays
+                        // put so the user can review what changed.
+                        if (record.Status == MigrationStatus.VerifiedComplete
+                            && !record.HadFailedAttempt
+                            && IsPlausiblePdf(record.FinalPdfPath))
                         {
                             try
                             {
@@ -365,6 +428,34 @@ namespace PublisherConverter.Core
             return options.EnableCircuitBreaker
                 && options.MaxConsecutiveFailures > 0
                 && _renderer.ConsecutiveFailures >= options.MaxConsecutiveFailures;
+        }
+
+        internal static RenderIntent NextLowerIntent(RenderIntent intent) => intent switch
+        {
+            RenderIntent.Commercial => RenderIntent.Printing,
+            RenderIntent.Printing   => RenderIntent.Standard,
+            _                       => RenderIntent.Standard
+        };
+
+        internal static string ComputeFallbackSuffix(RenderIntent intent, bool docStructureTags)
+        {
+            string suffix = "";
+            switch (intent)
+            {
+                case RenderIntent.Printing: suffix += "_printres"; break;
+                case RenderIntent.Standard: suffix += "_standardres"; break;
+            }
+            if (!docStructureTags) suffix += "_notags";
+            return suffix;
+        }
+
+        internal static string ApplyPdfSuffix(string pdfPath, string suffix)
+        {
+            if (string.IsNullOrEmpty(suffix)) return pdfPath;
+            string dir = Path.GetDirectoryName(pdfPath) ?? "";
+            string name = Path.GetFileNameWithoutExtension(pdfPath);
+            string ext = Path.GetExtension(pdfPath);
+            return Path.Combine(dir, name + suffix + ext);
         }
 
         private static List<string> CollectAttemptedSourcePaths(List<FileRecord> indexed)

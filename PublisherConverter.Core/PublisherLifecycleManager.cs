@@ -167,7 +167,15 @@ namespace PublisherConverter.Core
             }
         }
 
-        public async Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
+        public async Task ExecuteRenderingJobAsync(
+            FileRecord record,
+            string sourcePubPath,
+            string targetPdfPath,
+            bool runLinkCheck,
+            RenderIntent intent,
+            bool docStructureTags,
+            int timeoutSeconds,
+            CancellationToken cancellationToken)
         {
             var client = AcquireClient();
 
@@ -178,15 +186,38 @@ namespace PublisherConverter.Core
                 {
                     SourcePubPath = sourcePubPath,
                     TargetPdfPath = targetPdfPath,
-                    RunLinkCheck = runLinkCheck
+                    RunLinkCheck = runLinkCheck,
+                    Intent = intent,
+                    DocStructureTags = docStructureTags
                 }
             };
 
-            var response = await client.SendRequestAsync(request, timeoutSeconds, cancellationToken).ConfigureAwait(false);
+            WorkerResponse response;
+            try
+            {
+                response = await client.SendRequestAsync(request, timeoutSeconds, cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // The worker process appears to have died on us (pipe broken,
+                // EOF mid-message, etc.). Surface this distinctly so the
+                // orchestrator can apply its crash-specific fallback.
+                throw new RenderEngineCrashException(
+                    $"Worker process appears to have terminated during render: {ex.Message}", ex);
+            }
 
             if (!response.Success)
             {
-                throw new InvalidOperationException(response.ErrorMessage ?? "Unknown worker error during rendering.");
+                throw new RenderExportFailureException(
+                    response.ErrorMessage ?? "Worker reported render failure with no detail.");
             }
 
             if (response.RenderResult != null)

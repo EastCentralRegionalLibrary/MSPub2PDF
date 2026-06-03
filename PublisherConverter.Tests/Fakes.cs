@@ -17,6 +17,15 @@ namespace PublisherConverter.Tests
         }
     }
 
+    public class RenderAttempt
+    {
+        public string FileName { get; set; } = string.Empty;
+        public string SourcePubPath { get; set; } = string.Empty;
+        public string TargetPdfPath { get; set; } = string.Empty;
+        public RenderIntent Intent { get; set; }
+        public bool DocStructureTags { get; set; }
+    }
+
     public class FakePublisherRenderer : IPublisherRenderer
     {
         public int RenderCount { get; private set; }
@@ -25,21 +34,40 @@ namespace PublisherConverter.Tests
         public int MaxConsecutiveFailures { get; set; } = 3;
         public bool ShutdownCalled { get; private set; }
         public Queue<Func<FileRecord, Task>> RenderBehaviors { get; } = new Queue<Func<FileRecord, Task>>();
+        public List<RenderAttempt> Attempts { get; } = new List<RenderAttempt>();
 
         public void Initialize() { }
         public async Task InitializeAsync(CancellationToken cancellationToken) { await Task.CompletedTask; }
         public void Shutdown() { ShutdownCalled = true; }
 
-        public async Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken)
+        public async Task ExecuteRenderingJobAsync(
+            FileRecord record,
+            string sourcePubPath,
+            string targetPdfPath,
+            bool runLinkCheck,
+            RenderIntent intent,
+            bool docStructureTags,
+            int timeoutSeconds,
+            CancellationToken cancellationToken)
         {
             RenderCount++;
+            Attempts.Add(new RenderAttempt
+            {
+                FileName = record.FileName,
+                SourcePubPath = sourcePubPath,
+                TargetPdfPath = targetPdfPath,
+                Intent = intent,
+                DocStructureTags = docStructureTags
+            });
+
             if (RenderBehaviors.Count > 0)
             {
                 await RenderBehaviors.Dequeue()(record);
                 return;
             }
 
-            // Default behavior: create a dummy PDF file
+            // Default behavior: create a dummy PDF at the requested target path
+            // so the orchestrator's egress check passes.
             if (!File.Exists(targetPdfPath))
             {
                 string dir = Path.GetDirectoryName(targetPdfPath)!;

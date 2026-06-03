@@ -311,6 +311,8 @@ namespace PublisherConverter.Tests
                     Path.Combine(_workspaceDir, "reuse.pub"),
                     targetPath,
                     runLinkCheck: false,
+                    intent: RenderIntent.Commercial,
+                    docStructureTags: true,
                     timeoutSeconds: DefaultRequestTimeoutSeconds,
                     CancellationToken.None);
 
@@ -335,7 +337,7 @@ namespace PublisherConverter.Tests
             string targetPath = Path.Combine(_workspaceDir, "lm.pdf");
 
             var record = new FileRecord { FileName = "lm.pub" };
-            await manager.ExecuteRenderingJobAsync(record, sourcePath, targetPath, runLinkCheck: false, timeoutSeconds: DefaultRequestTimeoutSeconds, CancellationToken.None);
+            await manager.ExecuteRenderingJobAsync(record, sourcePath, targetPath, runLinkCheck: false, intent: RenderIntent.Commercial, docStructureTags: true, timeoutSeconds: DefaultRequestTimeoutSeconds, CancellationToken.None);
 
             Assert.True(File.Exists(targetPath));
             Assert.Equal(0, record.MissingAssetsCount);

@@ -71,9 +71,9 @@ namespace PublisherConverter.Core
                 doc.ExportAsFixedFormat(
                     Format: PbFixedFormatType.pbFixedFormatTypePDF,
                     Filename: job.TargetPdfPath,
-                    Intent: PbFixedFormatIntent.pbIntentCommercial,
+                    Intent: MapIntent(job.Intent),
                     IncludeDocumentProperties: true,
-                    DocStructureTags: true,
+                    DocStructureTags: job.DocStructureTags,
                     BitmapMissingFonts: true,
                     UseISO19005_1: true);
 
@@ -170,6 +170,14 @@ namespace PublisherConverter.Core
                 return null;
             }
         }
+
+        private static PbFixedFormatIntent MapIntent(RenderIntent intent) => intent switch
+        {
+            RenderIntent.Commercial => PbFixedFormatIntent.pbIntentCommercial,
+            RenderIntent.Printing   => PbFixedFormatIntent.pbIntentPrinting,
+            RenderIntent.Standard   => PbFixedFormatIntent.pbIntentStandard,
+            _                       => PbFixedFormatIntent.pbIntentCommercial
+        };
 
         private static void AuditDocumentLinks(Document doc, RenderResult result)
         {

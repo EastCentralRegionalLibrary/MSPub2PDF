@@ -53,6 +53,15 @@ namespace PublisherConverter.Core
         public string Details { get; set; } = "Pending processing.";
         public int MissingAssetsCount { get; set; } = 0;
         public string MissingAssetsList { get; set; } = "None";
+
+        /// <summary>
+        /// True when the engine had to retry — i.e. at least one render
+        /// attempt for this document threw an export error, timed out, or
+        /// looked like a Publisher crash. Used to keep the source .pub file
+        /// out of the auto-delete pass even if the final attempt succeeded,
+        /// so the user can review what changed.
+        /// </summary>
+        public bool HadFailedAttempt { get; set; } = false;
     }
 
     public class ProgressReport

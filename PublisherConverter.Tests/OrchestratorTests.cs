@@ -433,6 +433,168 @@ namespace PublisherConverter.Tests
             Assert.Equal(0, _renderer.RecycleCount);
         }
 
+        [Fact]
+        public async Task Orchestrator_ExportFailure_StepsDownIntent()
+        {
+            // Arrange — single file. First attempt throws RenderExportFailureException;
+            // engine should retry with the next-lower intent (Printing).
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcIntentStep");
+            Directory.CreateDirectory(sourceDir);
+            File.WriteAllText(Path.Combine(sourceDir, "a.pub"), "fake");
+
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderExportFailureException("export bombed"));
+            // 2nd attempt: succeed (default behavior writes a PDF at targetPath)
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(2, _renderer.Attempts.Count);
+            Assert.Equal(RenderIntent.Commercial, _renderer.Attempts[0].Intent);
+            Assert.Equal(RenderIntent.Printing, _renderer.Attempts[1].Intent);
+
+            // First attempt's target had no suffix; second attempt's did.
+            Assert.DoesNotContain("_printres", _renderer.Attempts[0].TargetPdfPath);
+            Assert.Contains("_printres", _renderer.Attempts[1].TargetPdfPath);
+
+            // Final PDF on disk uses the suffixed name.
+            Assert.True(File.Exists(Path.Combine(sourceDir, "a_printres.pdf")));
+            Assert.False(File.Exists(Path.Combine(sourceDir, "a.pdf")));
+
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            var record = _manifestWriter.WrittenRecords[0];
+            Assert.Equal(MigrationStatus.VerifiedComplete, record.Status);
+            Assert.True(record.HadFailedAttempt);
+        }
+
+        [Fact]
+        public async Task Orchestrator_TwoExportFailures_StepsDownToStandard()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcStandard");
+            Directory.CreateDirectory(sourceDir);
+            File.WriteAllText(Path.Combine(sourceDir, "doc.pub"), "fake");
+
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderExportFailureException("first bombed"));
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderExportFailureException("second bombed"));
+            // 3rd attempt succeeds with Standard.
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(3, _renderer.Attempts.Count);
+            Assert.Equal(RenderIntent.Commercial, _renderer.Attempts[0].Intent);
+            Assert.Equal(RenderIntent.Printing,   _renderer.Attempts[1].Intent);
+            Assert.Equal(RenderIntent.Standard,   _renderer.Attempts[2].Intent);
+
+            Assert.True(File.Exists(Path.Combine(sourceDir, "doc_standardres.pdf")));
+        }
+
+        [Fact]
+        public async Task Orchestrator_TwoCrashes_TurnsOffDocStructureTagsOnThirdAttempt()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcCrashTags");
+            Directory.CreateDirectory(sourceDir);
+            File.WriteAllText(Path.Combine(sourceDir, "fragile.pub"), "fake");
+
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderEngineCrashException("Publisher crashed"));
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderEngineCrashException("Publisher crashed again"));
+            // 3rd attempt succeeds — no behavior queued.
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(3, _renderer.Attempts.Count);
+            Assert.True(_renderer.Attempts[0].DocStructureTags);
+            Assert.True(_renderer.Attempts[1].DocStructureTags);
+            Assert.False(_renderer.Attempts[2].DocStructureTags);
+
+            // Crashes don't step intent down per spec — only export errors do.
+            Assert.All(_renderer.Attempts, a => Assert.Equal(RenderIntent.Commercial, a.Intent));
+
+            Assert.True(File.Exists(Path.Combine(sourceDir, "fragile_notags.pdf")));
+        }
+
+        [Fact]
+        public async Task Orchestrator_SuccessOnFirstTry_NoSuffixAndCanBeDeleted()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcCleanDelete");
+            Directory.CreateDirectory(sourceDir);
+            string pubFile = Path.Combine(sourceDir, "clean.pub");
+            File.WriteAllText(pubFile, "fake");
+
+            var options = new ConversionOptions { SourcePath = sourceDir, DeleteSourceOnSuccess = true };
+            var engine = CreateEngine();
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Single(_renderer.Attempts);
+            Assert.True(File.Exists(Path.Combine(sourceDir, "clean.pdf")));
+            Assert.False(File.Exists(pubFile)); // deleted
+
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.False(_manifestWriter.WrittenRecords[0].HadFailedAttempt);
+        }
+
+        [Fact]
+        public async Task Orchestrator_DegradedSuccess_KeepsSourceEvenWithDeleteOptionOn()
+        {
+            // A document that needed a retry (any error mode) must NOT have its
+            // source deleted, even though it eventually converted, so the user
+            // can review what changed.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcDegradedKeep");
+            Directory.CreateDirectory(sourceDir);
+            string pubFile = Path.Combine(sourceDir, "retry.pub");
+            File.WriteAllText(pubFile, "fake");
+
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderExportFailureException("needs retry"));
+            // 2nd attempt: succeeds.
+
+            var options = new ConversionOptions { SourcePath = sourceDir, DeleteSourceOnSuccess = true };
+            var engine = CreateEngine();
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.True(File.Exists(pubFile)); // kept
+            Assert.True(File.Exists(Path.Combine(sourceDir, "retry_printres.pdf")));
+        }
+
+        [Fact]
+        public async Task Orchestrator_DegradationDoesNotBleedAcrossDocuments()
+        {
+            // File 1 needs to step down to Standard. File 2 must start fresh
+            // at Commercial — state must reset between documents.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcIsolation");
+            Directory.CreateDirectory(sourceDir);
+            File.WriteAllText(Path.Combine(sourceDir, "a.pub"), "fake");
+            File.WriteAllText(Path.Combine(sourceDir, "b.pub"), "fake");
+
+            // File 1: two export errors, then succeeds at Standard.
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderExportFailureException("a1"));
+            _renderer.RenderBehaviors.Enqueue(_ => throw new RenderExportFailureException("a2"));
+            // File 1's third attempt: default (success at Standard).
+            // File 2: succeeds first try at Commercial.
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine();
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            // File 1 had 3 attempts; file 2 had 1.
+            Assert.Equal(4, _renderer.Attempts.Count);
+
+            // Last-attempted file 1: Standard. The first attempt of file 2 is
+            // also in the list — it must be Commercial, with tags on.
+            var fileBAttempts = _renderer.Attempts.FindAll(a => a.FileName == "b.pub");
+            Assert.Single(fileBAttempts);
+            Assert.Equal(RenderIntent.Commercial, fileBAttempts[0].Intent);
+            Assert.True(fileBAttempts[0].DocStructureTags);
+        }
+
         private class FakeProgressReporter : IProgressReporter
         {
             public void Report(ProgressReport report) { }
