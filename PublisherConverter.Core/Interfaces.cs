@@ -10,7 +10,15 @@ namespace PublisherConverter.Core
         void Initialize();
         Task InitializeAsync(CancellationToken cancellationToken);
         void Shutdown();
-        Task ExecuteRenderingJobAsync(FileRecord record, string sourcePubPath, string targetPdfPath, bool runLinkCheck, int timeoutSeconds, CancellationToken cancellationToken);
+        Task ExecuteRenderingJobAsync(
+            FileRecord record,
+            string sourcePubPath,
+            string targetPdfPath,
+            bool runLinkCheck,
+            RenderIntent intent,
+            bool docStructureTags,
+            int timeoutSeconds,
+            CancellationToken cancellationToken);
         void Recycle();
         bool RecordBatchFailure();
         void RecordBatchSuccess();

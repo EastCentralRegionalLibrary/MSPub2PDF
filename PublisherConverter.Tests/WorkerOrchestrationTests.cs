@@ -265,10 +265,36 @@ namespace PublisherConverter.Tests
 
             var record = new FileRecord { FileName = "test.pub" };
 
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: false, timeoutSeconds: 60, CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<RenderExportFailureException>(() =>
+                manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: false, intent: RenderIntent.Commercial, docStructureTags: true, timeoutSeconds: 60, CancellationToken.None));
 
             Assert.Contains("Rendering failed", ex.Message);
+        }
+
+        [Fact]
+        public async Task LifecycleManager_PipeBrokenSurfacesAsRenderEngineCrash()
+        {
+            var client = new FakePublisherWorkerClient { ThrowOnSend = true, SendException = new InvalidOperationException("Worker closed the pipe") };
+            var manager = new PublisherLifecycleManager(client);
+
+            var record = new FileRecord { FileName = "test.pub" };
+
+            var ex = await Assert.ThrowsAsync<RenderEngineCrashException>(() =>
+                manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: false, intent: RenderIntent.Commercial, docStructureTags: true, timeoutSeconds: 60, CancellationToken.None));
+
+            Assert.Contains("terminated", ex.Message);
+        }
+
+        [Fact]
+        public async Task LifecycleManager_TimeoutPropagatesUnchanged()
+        {
+            var client = new FakePublisherWorkerClient { ThrowOnSend = true, SendException = new TimeoutException("Worker request timed out after 5s.") };
+            var manager = new PublisherLifecycleManager(client);
+
+            var record = new FileRecord { FileName = "test.pub" };
+
+            await Assert.ThrowsAsync<TimeoutException>(() =>
+                manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: false, intent: RenderIntent.Commercial, docStructureTags: true, timeoutSeconds: 60, CancellationToken.None));
         }
 
         [Fact]
@@ -285,7 +311,7 @@ namespace PublisherConverter.Tests
             var manager = new PublisherLifecycleManager(client);
 
             var record = new FileRecord { FileName = "test.pub" };
-            await manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: true, timeoutSeconds: 60, CancellationToken.None);
+            await manager.ExecuteRenderingJobAsync(record, "/tmp/test.pub", "/tmp/test.pdf", runLinkCheck: true, intent: RenderIntent.Commercial, docStructureTags: true, timeoutSeconds: 60, CancellationToken.None);
 
             Assert.Equal(2, record.MissingAssetsCount);
             Assert.Equal("a | b", record.MissingAssetsList);
@@ -351,6 +377,8 @@ namespace PublisherConverter.Tests
                     "/tmp/x.pub",
                     "/tmp/x.pdf",
                     runLinkCheck: false,
+                    intent: RenderIntent.Commercial,
+                    docStructureTags: true,
                     timeoutSeconds: 5,
                     CancellationToken.None));
 
@@ -384,6 +412,7 @@ namespace PublisherConverter.Tests
             public bool EnsureStartedCalled { get; private set; }
             public bool Disposed { get; private set; }
             public bool ThrowOnSend { get; set; }
+            public Exception? SendException { get; set; }
 
             public bool IsHealthy { get; set; } = true;
             public WorkerRequest? LastRequest { get; private set; }
@@ -392,7 +421,7 @@ namespace PublisherConverter.Tests
             public Task<WorkerResponse> SendRequestAsync(WorkerRequest request, int? timeoutSeconds, CancellationToken cancellationToken)
             {
                 LastRequest = request;
-                if (ThrowOnSend) throw new InvalidOperationException("Simulated send failure");
+                if (ThrowOnSend) throw SendException ?? new InvalidOperationException("Simulated send failure");
                 return Task.FromResult(NextResponse);
             }
 
