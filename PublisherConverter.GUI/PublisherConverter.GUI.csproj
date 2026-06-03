@@ -8,6 +8,7 @@
     <OutputType>WinExe</OutputType>
     <StartupObject>PublisherConverter.GUI.Program</StartupObject>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <ApplicationIcon>PubtoPdf.ico</ApplicationIcon>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>

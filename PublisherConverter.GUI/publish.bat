@@ -1,0 +1,2 @@
+dotnet publish -r win-x64 -c Release --self-contained true /p:PublishSingleFile=true
+REM "C:\Program Files (x86)\Windows Kits\10\tools\bin\i386\signtool.exe" sign /sha1 {yourcertsha1} /tr http://timestamp.digicert.com /td sha256 /fd sha256 \bin\Release\net8.0-windows\win-x64\PublisherConverter\publisherconverter.gui.exe
