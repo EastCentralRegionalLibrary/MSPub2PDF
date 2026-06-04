@@ -113,6 +113,24 @@ namespace PublisherConverter.Core
         public int FileTimeoutSeconds { get; set; } = 60;
 
         /// <summary>
+        /// When true, the orchestrator hands the per-file missing-font list
+        /// to <see cref="IFontResolver"/> before failing the document so the
+        /// resolver can attempt a best-effort install (Windows optional-font
+        /// capability and/or downloadable fallback per FontMapping.json).
+        /// Defaults to false — pre-flight rejects unresolved fonts as before.
+        /// </summary>
+        public bool EnableAutoFontInstallation { get; set; } = false;
+
+        /// <summary>
+        /// When true, files with still-missing fonts (after any resolution
+        /// attempt) are sent to the renderer anyway instead of being rejected.
+        /// Missing-font diagnostics on the FileRecord and in the
+        /// FontPreflightReport are preserved either way. Defaults to false —
+        /// pre-flight blocks the file as before.
+        /// </summary>
+        public bool OverrideFontSkip { get; set; } = false;
+
+        /// <summary>
         /// Absolute source paths to skip during discovery. The GUI's "Continue"
         /// flow populates this with files attempted in a prior run so resuming
         /// after a circuit-breaker trip processes only the remaining work.

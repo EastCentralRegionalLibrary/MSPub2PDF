@@ -132,6 +132,42 @@ namespace PublisherConverter.Tests
         }
     }
 
+    /// <summary>
+    /// In-process font resolver for orchestrator tests. The caller seeds a
+    /// per-font outcome map; ResolveMissingFontsAsync returns the resolved /
+    /// still-missing split accordingly. Tracks every call for assertions.
+    /// </summary>
+    public class FakeFontResolver : IFontResolver
+    {
+        public Dictionary<string, bool> ResolveOutcomes { get; }
+            = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        public int CallCount { get; private set; }
+        public List<IReadOnlyList<string>> CallInputs { get; } = new List<IReadOnlyList<string>>();
+
+        public Task<FontResolutionOutcome> ResolveMissingFontsAsync(IReadOnlyList<string> missingFonts, CancellationToken cancellationToken)
+        {
+            CallCount++;
+            CallInputs.Add(missingFonts);
+
+            var resolved = new List<string>();
+            var stillMissing = new List<string>();
+            foreach (var f in missingFonts)
+            {
+                if (ResolveOutcomes.TryGetValue(f, out var ok) && ok) resolved.Add(f);
+                else stillMissing.Add(f);
+            }
+
+            return Task.FromResult(new FontResolutionOutcome
+            {
+                InitiallyMissing = missingFonts,
+                Resolved = resolved,
+                StillMissing = stillMissing,
+                Log = new[] { $"fake resolver: resolved {resolved.Count}, still missing {stillMissing.Count}" }
+            });
+        }
+    }
+
     public class FakeManifestWriter : IManifestWriter
     {
         public string? WrittenDirectory { get; private set; }

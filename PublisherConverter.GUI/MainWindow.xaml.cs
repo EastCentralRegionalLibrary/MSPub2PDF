@@ -31,9 +31,26 @@ namespace PublisherConverter.GUI
             var hashProvider = new HashProvider();
             var manifestWriter = new ManifestWriter();
             var renderer = new PublisherLifecycleManager();
-            var fontAuditor = new FontAuditor(
-                new PublisherFontExtractor(),
-                new FontAvailabilityCache(new WindowsRegistryFontProvider()));
+
+            // Shared cache so the auditor and the resolver agree on
+            // installed-font state. The resolver mutates the cache after
+            // successful provisioning; the next per-file audit picks it up.
+            var fontCache = new FontAvailabilityCache(new WindowsRegistryFontProvider());
+            var fontAuditor = new FontAuditor(new PublisherFontExtractor(), fontCache);
+
+            // Mapping ships next to the GUI binary; missing/malformed file
+            // collapses to an empty table and the resolver simply finds
+            // nothing to provision.
+            string mappingPath = System.IO.Path.Combine(System.AppContext.BaseDirectory, "FontMapping.json");
+            var fontMappings = FontMappingLoader.LoadFromFile(mappingPath);
+
+            var fontResolver = new FontResolver(
+                fontCache,
+                new IFontProvisioningStrategy[]
+                {
+                    new WindowsCapabilityProvisioningStrategy(fontMappings, new DefaultPowerShellRunner()),
+                    new DownloadableFontProvisioningStrategy(fontMappings, new HttpFontDownloader()),
+                });
 
             _engine = new ConverterEngine(
                 inspector,
@@ -41,6 +58,7 @@ namespace PublisherConverter.GUI
                 manifestWriter,
                 renderer,
                 fontAuditor,
+                fontResolver,
                 (path, compress) => new ArchiveService(path, compress)
             );
         }
@@ -149,6 +167,8 @@ namespace PublisherConverter.GUI
                 MaxConsecutiveFailures = maxFailures,
                 CompressArchive = ChkCompressArchive.IsChecked ?? true,
                 FileTimeoutSeconds = timeoutSeconds,
+                EnableAutoFontInstallation = ChkEnableAutoFontInstall.IsChecked ?? false,
+                OverrideFontSkip = ChkOverrideFontSkip.IsChecked ?? false,
                 SkipSourcePaths = resuming ? new HashSet<string>(_attemptedSourcePaths, StringComparer.OrdinalIgnoreCase) : null
             };
 
@@ -230,6 +250,8 @@ namespace PublisherConverter.GUI
             TxtMaxFailures.IsEnabled = !isRunning;
             ChkCompressArchive.IsEnabled = !isRunning;
             TxtTimeout.IsEnabled = !isRunning;
+            ChkEnableAutoFontInstall.IsEnabled = !isRunning;
+            ChkOverrideFontSkip.IsEnabled = !isRunning;
         }
 
         private void AppendConsoleLog(string message)

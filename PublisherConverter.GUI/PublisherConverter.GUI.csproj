@@ -4,6 +4,12 @@
     <ProjectReference Include="..\PublisherConverter.Core\PublisherConverter.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="FontMapping.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <StartupObject>PublisherConverter.GUI.Program</StartupObject>

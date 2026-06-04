@@ -17,17 +17,15 @@ namespace PublisherConverter.Core
     /// every font in every document without paying registry I/O each time.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    public sealed class WindowsRegistryFontProvider : IInstalledFontProvider
+    public sealed class WindowsRegistryFontProvider : IRefreshableInstalledFontProvider
     {
         private const string FontsSubKey = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
 
-        private readonly HashSet<string> _installed;
+        private volatile HashSet<string> _installed;
 
         public WindowsRegistryFontProvider()
         {
-            _installed = new HashSet<string>(StringComparer.Ordinal);
-            EnumerateRegistry(Registry.LocalMachine, _installed);
-            EnumerateRegistry(Registry.CurrentUser, _installed);
+            _installed = BuildIndex();
         }
 
         public bool IsInstalled(string family)
@@ -36,7 +34,25 @@ namespace PublisherConverter.Core
             return _installed.Contains(FontNameNormalizer.Normalize(family));
         }
 
+        /// <summary>
+        /// Re-enumerates the machine and current-user font registrations. Cheap
+        /// enough to call after a font install so the next lookup sees a font
+        /// that landed under its real family name.
+        /// </summary>
+        public void Refresh()
+        {
+            _installed = BuildIndex();
+        }
+
         public IReadOnlyCollection<string> NormalizedFontNames => _installed;
+
+        private static HashSet<string> BuildIndex()
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            EnumerateRegistry(Registry.LocalMachine, set);
+            EnumerateRegistry(Registry.CurrentUser, set);
+            return set;
+        }
 
         private static void EnumerateRegistry(RegistryKey root, HashSet<string> sink)
         {

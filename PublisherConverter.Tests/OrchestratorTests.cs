@@ -23,7 +23,7 @@ namespace PublisherConverter.Tests
             Directory.CreateDirectory(_testWorkspaceDir);
         }
 
-        private ConverterEngine CreateEngine(IFontAuditor? fontAuditor = null)
+        private ConverterEngine CreateEngine(IFontAuditor? fontAuditor = null, IFontResolver? fontResolver = null)
         {
             return new ConverterEngine(
                 _inspector,
@@ -31,6 +31,7 @@ namespace PublisherConverter.Tests
                 _manifestWriter,
                 _renderer,
                 fontAuditor ?? new NoOpFontAuditor(),
+                fontResolver ?? new NoOpFontResolver(),
                 (path, compress) => {
                     var svc = new FakeArchiveService { Compress = compress };
                     _archiveServices.Add(svc);
@@ -695,6 +696,211 @@ namespace PublisherConverter.Tests
             auditor.MissingByPath.Clear();
             await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
             Assert.False(engine.LatestFontPreflightReport.HasFindings);
+        }
+
+        [Fact]
+        public async Task AutoResolve_Off_OverrideOff_FailsLikeBefore()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "AutoOffOverrideOff");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "x.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Lemon Cookie Bold" };
+            var resolver = new FakeFontResolver();
+
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                EnableAutoFontInstallation = false,
+                OverrideFontSkip = false,
+            };
+            var engine = CreateEngine(auditor, resolver);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(0, resolver.CallCount);
+            Assert.Equal(0, _renderer.RenderCount);
+            Assert.Equal(MigrationStatus.FailedConversion, _manifestWriter.WrittenRecords![0].Status);
+            Assert.Equal("Lemon Cookie Bold", _manifestWriter.WrittenRecords[0].MissingFontsList);
+        }
+
+        [Fact]
+        public async Task AutoResolve_On_ResolverSucceeds_FileConvertsCleanly()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "AutoOnSuccess");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "x.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Mangal", "PMingLiU" };
+            var resolver = new FakeFontResolver();
+            resolver.ResolveOutcomes["Mangal"] = true;
+            resolver.ResolveOutcomes["PMingLiU"] = true;
+
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                EnableAutoFontInstallation = true,
+                OverrideFontSkip = false,
+            };
+            var engine = CreateEngine(auditor, resolver);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(1, resolver.CallCount);
+            Assert.Equal(1, _renderer.RenderCount);
+
+            var record = _manifestWriter.WrittenRecords![0];
+            Assert.Equal(MigrationStatus.VerifiedComplete, record.Status);
+            Assert.Equal(0, record.MissingFontsCount);
+            Assert.Equal("None", record.MissingFontsList);
+
+            // Fully resolved + clean run → the preflight report should be empty.
+            Assert.False(engine.LatestFontPreflightReport.HasFindings);
+        }
+
+        [Fact]
+        public async Task AutoResolve_On_ResolverPartialFails_OverrideOff_StillRejectsRemaining()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "AutoOnPartial");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "x.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Mangal", "Lemon Cookie Bold" };
+            var resolver = new FakeFontResolver();
+            resolver.ResolveOutcomes["Mangal"] = true;
+            resolver.ResolveOutcomes["Lemon Cookie Bold"] = false;
+
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                EnableAutoFontInstallation = true,
+                OverrideFontSkip = false,
+            };
+            var engine = CreateEngine(auditor, resolver);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(0, _renderer.RenderCount);
+
+            var record = _manifestWriter.WrittenRecords![0];
+            Assert.Equal(MigrationStatus.FailedConversion, record.Status);
+            // Only the still-missing font remains in the diagnostic.
+            Assert.Equal(1, record.MissingFontsCount);
+            Assert.Equal("Lemon Cookie Bold", record.MissingFontsList);
+
+            // The end-of-run report shows only what couldn't be resolved.
+            var report = engine.LatestFontPreflightReport;
+            Assert.True(report.HasFindings);
+            Assert.False(report.FilesByMissingFont.ContainsKey("Mangal"));
+            Assert.Contains(p, report.FilesByMissingFont["Lemon Cookie Bold"]);
+        }
+
+        [Fact]
+        public async Task AutoResolve_Off_Override_On_RendersWithMissingFontsAndPreservesDiagnostics()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "AutoOffOverrideOn");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "x.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Lemon Cookie Bold", "New York" };
+            var resolver = new FakeFontResolver(); // never called
+
+            var capturedLog = new List<string>();
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                EnableAutoFontInstallation = false,
+                OverrideFontSkip = true,
+            };
+            var engine = CreateEngine(auditor, resolver);
+
+            await engine.ExecuteMigrationAsync(options, new CapturingProgressReporter(capturedLog), CancellationToken.None);
+
+            Assert.Equal(0, resolver.CallCount);
+            Assert.Equal(1, _renderer.RenderCount); // got rendered
+
+            var record = _manifestWriter.WrittenRecords![0];
+            // Renderer succeeded in the fake → status verified, but the
+            // missing-font diagnostics survive.
+            Assert.Equal(MigrationStatus.VerifiedComplete, record.Status);
+            Assert.Equal(2, record.MissingFontsCount);
+            Assert.Equal("Lemon Cookie Bold | New York", record.MissingFontsList);
+
+            // The preflight report still lists the file under each missing font.
+            var report = engine.LatestFontPreflightReport;
+            Assert.True(report.HasFindings);
+            Assert.Contains(p, report.FilesByMissingFont["Lemon Cookie Bold"]);
+            Assert.Contains(p, report.FilesByMissingFont["New York"]);
+
+            // The log makes the override path obvious.
+            Assert.Contains(capturedLog, l => l.Contains("Override") && l.Contains("Lemon Cookie Bold"));
+            Assert.Contains(capturedLog, l => l.Contains("Font pre-flight summary"));
+        }
+
+        [Fact]
+        public async Task Override_On_KeepsSourceFileEvenWithDeleteOption()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "OverrideKeep");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "x.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Missing One" };
+
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                OverrideFontSkip = true,
+                DeleteSourceOnSuccess = true,
+            };
+            var engine = CreateEngine(auditor);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            // Renderer ran (override let it through) and the fake produced a
+            // valid PDF, but the source must NOT be deleted while missing-font
+            // diagnostics are still attached.
+            Assert.True(File.Exists(p));
+            Assert.True(_manifestWriter.WrittenRecords![0].MissingFontsCount > 0);
+        }
+
+        [Fact]
+        public async Task AutoResolve_On_Override_On_FailsResolverButStillRenders()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "AutoOnOverrideOn");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "x.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Lemon Cookie Bold" };
+            var resolver = new FakeFontResolver(); // resolution will fail
+
+            var options = new ConversionOptions
+            {
+                SourcePath = sourceDir,
+                EnableAutoFontInstallation = true,
+                OverrideFontSkip = true,
+            };
+            var engine = CreateEngine(auditor, resolver);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.Equal(1, resolver.CallCount);
+            Assert.Equal(1, _renderer.RenderCount);
+
+            var record = _manifestWriter.WrittenRecords![0];
+            Assert.Equal(MigrationStatus.VerifiedComplete, record.Status);
+            Assert.Equal("Lemon Cookie Bold", record.MissingFontsList);
         }
 
         private class FakeProgressReporter : IProgressReporter

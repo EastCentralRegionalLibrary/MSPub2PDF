@@ -1,0 +1,28 @@
+{
+  // FontMapping.json — drives the auto-font-installer feature.
+  // Keys are case- and whitespace-insensitive thanks to FontNameNormalizer,
+  // so "PMingLiU", "pmingliu", and "p ming liu" all resolve to the same entry.
+  // The resolver tries windowsCapabilities first, then externalFallbacks.
+  // Edit freely; the file is reloaded each time the app starts.
+  "windowsCapabilities": {
+    "Batang":       "Language.Fonts.Kore~~~und-KORE0.0.1.0",
+    "BatangChe":    "Language.Fonts.Kore~~~und-KORE0.0.1.0",
+    "GulimChe":     "Language.Fonts.Kore~~~und-KORE0.0.1.0",
+    "Malgun Gothic":"Language.Fonts.Kore~~~und-KORE0.0.1.0",
+    "Mangal":       "Language.Fonts.Deva~~~und-DEVA0.0.1.0",
+    "Latha":        "Language.Fonts.Taml~~~und-TAML0.0.1.0",
+    "PMingLiU":     "Language.Fonts.Hant~~~und-HANT0.0.1.0",
+    "MingLiU":      "Language.Fonts.Hant~~~und-HANT0.0.1.0",
+    "SimSun":       "Language.Fonts.Hans~~~und-HANS0.0.1.0",
+    "NSimSun":      "Language.Fonts.Hans~~~und-HANS0.0.1.0",
+    "MS Mincho":    "Language.Fonts.Jpan~~~und-JPAN0.0.1.0",
+    "MS Gothic":    "Language.Fonts.Jpan~~~und-JPAN0.0.1.0",
+    "BrowalliaUPC": "Language.Fonts.Thai~~~und-THAI0.0.1.0",
+    "Angsana New":  "Language.Fonts.Thai~~~und-THAI0.0.1.0"
+  },
+  "externalFallbacks": {
+    "Batang":   { "name": "Noto Serif KR",         "fileName": "NotoSerifKR-Regular.ttf",         "source": "github", "url": "https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/Korean/NotoSerifCJKkr-Regular.otf" },
+    "PMingLiU": { "name": "Noto Serif TC",         "fileName": "NotoSerifTC-Regular.ttf",         "source": "github", "url": "https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/TraditionalChinese/NotoSerifCJKtc-Regular.otf" },
+    "Mangal":   { "name": "Noto Sans Devanagari",  "fileName": "NotoSansDevanagari-Regular.ttf",  "source": "github", "url": "https://github.com/notofonts/devanagari/raw/main/fonts/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Regular.ttf" }
+  }
+}
