@@ -42,6 +42,13 @@ namespace PublisherConverter.Core
     {
         public int MissingAssetsCount { get; set; }
         public string MissingAssetsList { get; set; } = "None";
+
+        /// <summary>
+        /// Populated by FontAuditor.AuditFonts: count of font families
+        /// referenced by the document that are not installed locally.
+        /// </summary>
+        public int MissingFontsCount { get; set; }
+        public string MissingFontsList { get; set; } = "None";
     }
 
     /// <summary>

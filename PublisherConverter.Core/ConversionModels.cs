@@ -55,6 +55,15 @@ namespace PublisherConverter.Core
         public string MissingAssetsList { get; set; } = "None";
 
         /// <summary>
+        /// Populated by the font pre-flight check when the document refers
+        /// to fonts not installed on the local system. When non-zero, the
+        /// document is rejected before it ever reaches Publisher to avoid
+        /// the export-time crash.
+        /// </summary>
+        public int MissingFontsCount { get; set; } = 0;
+        public string MissingFontsList { get; set; } = "None";
+
+        /// <summary>
         /// True when the engine had to retry — i.e. at least one render
         /// attempt for this document threw an export error, timed out, or
         /// looked like a Publisher crash. Used to keep the source .pub file

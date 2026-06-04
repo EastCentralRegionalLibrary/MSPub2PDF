@@ -23,13 +23,14 @@ namespace PublisherConverter.Tests
             Directory.CreateDirectory(_testWorkspaceDir);
         }
 
-        private ConverterEngine CreateEngine()
+        private ConverterEngine CreateEngine(IFontAuditor? fontAuditor = null)
         {
             return new ConverterEngine(
                 _inspector,
                 _hashProvider,
                 _manifestWriter,
                 _renderer,
+                fontAuditor ?? new NoOpFontAuditor(),
                 (path, compress) => {
                     var svc = new FakeArchiveService { Compress = compress };
                     _archiveServices.Add(svc);
@@ -595,9 +596,120 @@ namespace PublisherConverter.Tests
             Assert.True(fileBAttempts[0].DocStructureTags);
         }
 
+        [Fact]
+        public async Task Orchestrator_FontPreflight_SkipsRenderingAndAggregatesReport()
+        {
+            // Two files: "missing.pub" references a font that's missing
+            // locally; "clean.pub" doesn't. The first must be rejected
+            // before reaching the renderer; the second must convert normally.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcFontPreflight");
+            Directory.CreateDirectory(sourceDir);
+            string missingPath = Path.Combine(sourceDir, "missing.pub");
+            string cleanPath = Path.Combine(sourceDir, "clean.pub");
+            File.WriteAllText(missingPath, "fake content");
+            File.WriteAllText(cleanPath, "fake content");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[missingPath] = new[] { "Lemon Cookie Bold", "New York" };
+
+            var capturedLogLines = new List<string>();
+            var capturingReporter = new CapturingProgressReporter(capturedLogLines);
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine(auditor);
+
+            // Act
+            await engine.ExecuteMigrationAsync(options, capturingReporter, CancellationToken.None);
+
+            // Only the clean file should have reached the renderer.
+            Assert.Equal(1, _renderer.RenderCount);
+            Assert.NotNull(_manifestWriter.WrittenRecords);
+            Assert.Equal(2, _manifestWriter.WrittenRecords.Count);
+
+            var missingRecord = _manifestWriter.WrittenRecords.Find(r => r.FileName == "missing.pub");
+            Assert.NotNull(missingRecord);
+            Assert.Equal(MigrationStatus.FailedConversion, missingRecord.Status);
+            Assert.Equal(2, missingRecord.MissingFontsCount);
+            Assert.Equal("Lemon Cookie Bold | New York", missingRecord.MissingFontsList);
+            Assert.Contains("missing system font", missingRecord.Details);
+
+            var cleanRecord = _manifestWriter.WrittenRecords.Find(r => r.FileName == "clean.pub");
+            Assert.NotNull(cleanRecord);
+            Assert.Equal(MigrationStatus.VerifiedComplete, cleanRecord.Status);
+            Assert.Equal(0, cleanRecord.MissingFontsCount);
+
+            // The end-of-run summary should appear in the log, grouped by font,
+            // with the affected file path listed.
+            Assert.Contains(capturedLogLines, l => l.Contains("Font pre-flight summary"));
+            Assert.Contains(capturedLogLines, l => l.Contains("Lemon Cookie Bold"));
+            Assert.Contains(capturedLogLines, l => l.Contains("New York"));
+            Assert.Contains(capturedLogLines, l => l.Contains(missingPath));
+
+            // The report is also exposed programmatically for the future auto-installer.
+            var report = engine.LatestFontPreflightReport;
+            Assert.True(report.HasFindings);
+            Assert.Equal(2, report.DistinctMissingFontCount);
+            Assert.Contains(missingPath, report.FilesByMissingFont["Lemon Cookie Bold"]);
+            Assert.Contains(missingPath, report.FilesByMissingFont["New York"]);
+        }
+
+        [Fact]
+        public async Task Orchestrator_FontPreflight_FailedFileIsNotDeletedEvenWithDeleteOption()
+        {
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcFontPreflightKeep");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "fragile.pub");
+            File.WriteAllText(p, "fake content");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Missing Font" };
+
+            var options = new ConversionOptions { SourcePath = sourceDir, DeleteSourceOnSuccess = true };
+            var engine = CreateEngine(auditor);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+
+            Assert.True(File.Exists(p), "Source file should not be deleted when the pre-flight rejects it.");
+        }
+
+        [Fact]
+        public async Task Orchestrator_FontPreflight_ReportResetsBetweenRuns()
+        {
+            // Engines are reused across "Continue" runs; LatestFontPreflightReport
+            // should reflect only the latest run, not accumulate forever.
+            string sourceDir = Path.Combine(_testWorkspaceDir, "SrcFontReset");
+            Directory.CreateDirectory(sourceDir);
+            string p = Path.Combine(sourceDir, "a.pub");
+            File.WriteAllText(p, "fake");
+
+            var auditor = new FakeFontAuditor();
+            auditor.MissingByPath[p] = new[] { "Ghost Font" };
+
+            var options = new ConversionOptions { SourcePath = sourceDir };
+            var engine = CreateEngine(auditor);
+
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+            Assert.True(engine.LatestFontPreflightReport.HasFindings);
+
+            // Second run: no missing fonts for this path now.
+            auditor.MissingByPath.Clear();
+            await engine.ExecuteMigrationAsync(options, new FakeProgressReporter(), CancellationToken.None);
+            Assert.False(engine.LatestFontPreflightReport.HasFindings);
+        }
+
         private class FakeProgressReporter : IProgressReporter
         {
             public void Report(ProgressReport report) { }
+        }
+
+        private class CapturingProgressReporter : IProgressReporter
+        {
+            private readonly List<string> _sink;
+            public CapturingProgressReporter(List<string> sink) { _sink = sink; }
+            public void Report(ProgressReport report)
+            {
+                if (!string.IsNullOrEmpty(report.CurrentActionMessage)) _sink.Add(report.CurrentActionMessage);
+            }
         }
 
         public void Dispose()

@@ -14,20 +14,44 @@ namespace PublisherConverter.Core
         private readonly IHashProvider _hashProvider;
         private readonly IManifestWriter _manifestWriter;
         private readonly IPublisherRenderer _renderer;
+        private readonly IFontAuditor _fontAuditor;
         private readonly Func<string, bool, IArchiveService> _archiveServiceFactory;
+
+        // Latest run's font pre-flight findings, accessible after
+        // ExecuteMigrationAsync returns so the GUI (and a future automated
+        // font-installer feature) can iterate the missing-font → files map
+        // without re-parsing log output.
+        public FontPreflightReport LatestFontPreflightReport { get; private set; } = new FontPreflightReport();
 
         public ConverterEngine(
             IFileInspector inspector,
             IHashProvider hashProvider,
             IManifestWriter manifestWriter,
             IPublisherRenderer renderer,
+            IFontAuditor fontAuditor,
             Func<string, bool, IArchiveService> archiveServiceFactory)
         {
             _inspector = inspector;
             _hashProvider = hashProvider;
             _manifestWriter = manifestWriter;
             _renderer = renderer;
+            _fontAuditor = fontAuditor ?? new NoOpFontAuditor();
             _archiveServiceFactory = archiveServiceFactory;
+        }
+
+        /// <summary>
+        /// Backwards-compatible constructor — wires a NoOp font auditor so the
+        /// orchestrator runs as it did before the pre-flight feature shipped.
+        /// Production callers should use the overload that takes IFontAuditor.
+        /// </summary>
+        public ConverterEngine(
+            IFileInspector inspector,
+            IHashProvider hashProvider,
+            IManifestWriter manifestWriter,
+            IPublisherRenderer renderer,
+            Func<string, bool, IArchiveService> archiveServiceFactory)
+            : this(inspector, hashProvider, manifestWriter, renderer, new NoOpFontAuditor(), archiveServiceFactory)
+        {
         }
 
         public async Task ExecuteMigrationAsync(ConversionOptions options, IProgress<ProgressReport> progress, CancellationToken cancellationToken)
@@ -54,6 +78,10 @@ namespace PublisherConverter.Core
                     throw new InvalidOperationException($"Failed to initialize backup directory structure: {ex.Message}", ex);
                 }
             }
+
+            // Fresh report for this run — the engine instance can be reused
+            // across multiple ExecuteMigrationAsync calls (Continue flow).
+            LatestFontPreflightReport = new FontPreflightReport();
 
             try
             {
@@ -142,6 +170,42 @@ namespace PublisherConverter.Core
                         continue;
                     }
                     record.SourceHash = _hashProvider.GetSha256Hash(record.OriginalFullPath);
+
+                    // Step A.5: Font Pre-flight
+                    // Publisher crashes on export when a referenced font is missing
+                    // and substitution rules aren't set. Detecting this without
+                    // opening the file lets us short-circuit with a clean failure
+                    // record and keep the worker alive. The per-file missing list
+                    // is also rolled up into LatestFontPreflightReport for the
+                    // end-of-run summary (and the future auto-installer hook).
+                    IReadOnlyList<string> missingFonts;
+                    try
+                    {
+                        missingFonts = _fontAuditor.ResolveMissingFonts(record.OriginalFullPath);
+                    }
+                    catch (Exception fontEx)
+                    {
+                        // A failure in pre-flight shouldn't block the run — log
+                        // it and proceed; the worker's own backstop still applies.
+                        reporter.Report(UpdateProgressState(report, $"Font pre-flight failed on {record.FileName}: {fontEx.Message}", record));
+                        missingFonts = Array.Empty<string>();
+                    }
+
+                    if (missingFonts.Count > 0)
+                    {
+                        record.MissingFontsCount = missingFonts.Count;
+                        record.MissingFontsList = string.Join(" | ", missingFonts);
+                        record.Status = MigrationStatus.FailedConversion;
+                        record.Details = $"Pre-flight rejected: missing system font(s) [{record.MissingFontsList}] would crash Publisher on export.";
+
+                        LatestFontPreflightReport.RecordMissingFonts(record.OriginalFullPath, missingFonts);
+
+                        report.FailureCount++;
+                        report.ProcessedFiles++;
+                        record.ProcessedAtUtc = DateTime.UtcNow;
+                        reporter.Report(UpdateProgressState(report, $"Skipped (font pre-flight): {record.FileName} → {record.MissingFontsList}", record));
+                        continue;
+                    }
 
                     // Step B: Ingress Staging
                     try
@@ -399,6 +463,18 @@ namespace PublisherConverter.Core
                             }
                             catch { }
                         }
+                    }
+                }
+
+                // End-of-run font pre-flight summary. Emitted via the progress
+                // reporter so the GUI's console picks it up alongside per-file
+                // output. Programmatic consumers (e.g. a future auto-installer)
+                // read LatestFontPreflightReport.FilesByMissingFont directly.
+                if (LatestFontPreflightReport.HasFindings)
+                {
+                    foreach (string line in LatestFontPreflightReport.EnumerateSummaryLines())
+                    {
+                        reporter.Report(UpdateProgressState(report, line, null));
                     }
                 }
             }

@@ -31,12 +31,16 @@ namespace PublisherConverter.GUI
             var hashProvider = new HashProvider();
             var manifestWriter = new ManifestWriter();
             var renderer = new PublisherLifecycleManager();
+            var fontAuditor = new FontAuditor(
+                new PublisherFontExtractor(),
+                new FontAvailabilityCache(new WindowsRegistryFontProvider()));
 
             _engine = new ConverterEngine(
                 inspector,
                 hashProvider,
                 manifestWriter,
                 renderer,
+                fontAuditor,
                 (path, compress) => new ArchiveService(path, compress)
             );
         }

@@ -107,6 +107,31 @@ namespace PublisherConverter.Tests
         public void Dispose() => Disposed = true;
     }
 
+    /// <summary>
+    /// In-process font auditor for orchestrator tests. The caller seeds a
+    /// path → missing-fonts map; ResolveMissingFonts looks each call up.
+    /// Unmentioned paths report no missing fonts.
+    /// </summary>
+    public class FakeFontAuditor : IFontAuditor
+    {
+        public Dictionary<string, IReadOnlyList<string>> MissingByPath { get; }
+            = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        public List<string> CalledForPaths { get; } = new List<string>();
+
+        public IReadOnlyList<string> ResolveMissingFonts(string pubPath)
+        {
+            CalledForPaths.Add(pubPath);
+            return MissingByPath.TryGetValue(pubPath, out var list) ? list : Array.Empty<string>();
+        }
+
+        public void AuditFonts(string pubPath, RenderResult result)
+        {
+            var missing = ResolveMissingFonts(pubPath);
+            result.MissingFontsCount = missing.Count;
+            result.MissingFontsList = missing.Count == 0 ? "None" : string.Join(" | ", missing);
+        }
+    }
+
     public class FakeManifestWriter : IManifestWriter
     {
         public string? WrittenDirectory { get; private set; }
