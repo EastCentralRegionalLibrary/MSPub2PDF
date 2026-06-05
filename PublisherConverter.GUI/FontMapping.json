@@ -1,9 +1,17 @@
 {
-  // FontMapping.json — drives the auto-font-installer feature.
-  // Keys are case- and whitespace-insensitive thanks to FontNameNormalizer,
-  // so "PMingLiU", "pmingliu", and "p ming liu" all resolve to the same entry.
-  // The resolver tries windowsCapabilities first, then externalFallbacks.
+  // FontMapping.json — drives the auto-font-installer pipeline.
+  //
+  // Keys are case-, whitespace-, and hyphen-insensitive (FontNameNormalizer),
+  // so "PMingLiU", "pmingliu", and "p ming liu" resolve to the same entry.
   // Edit freely; the file is reloaded each time the app starts.
+  //
+  // Strategies run in this fixed order; the first one to claim and resolve
+  // a font wins, and the resolver records it as installed:
+  //   1. windowsCapabilities — DISM Add-WindowsCapability (Windows-native).
+  //   2. googleFonts         — Google Fonts public CSS endpoint.
+  //   3. githubFonts         — public GitHub raw content OR release assets.
+  //   4. externalFallbacks   — generic one-off direct URL.
+
   "windowsCapabilities": {
     "Batang":       "Language.Fonts.Kore~~~und-KORE0.0.1.0",
     "BatangChe":    "Language.Fonts.Kore~~~und-KORE0.0.1.0",
@@ -20,9 +28,45 @@
     "BrowalliaUPC": "Language.Fonts.Thai~~~und-THAI0.0.1.0",
     "Angsana New":  "Language.Fonts.Thai~~~und-THAI0.0.1.0"
   },
+
+  // googleFonts: queries the unauthenticated Google Fonts CSS endpoint.
+  // Only the family name is required — `family` is an optional override
+  // when the publication's family name differs from Google's spelling.
+  "googleFonts": {
+    "Roboto":         {},
+    "Open Sans":      {},
+    "Noto Sans":      {},
+    "Lobster":        {},
+    "Source Sans Pro":{ "family": "Source Sans Pro" }
+  },
+
+  // githubFonts: two modes selected by which fields are populated.
+  //   Raw-content mode — set `path` and (optionally) `ref`. The strategy
+  //                      pulls https://raw.githubusercontent.com/owner/repo/ref/path.
+  //   Release-asset mode — leave `path` blank and use `release` (defaults
+  //                      to "latest") plus either `asset` (exact name) or
+  //                      `assetPattern` (glob, e.g. "*.ttf"). Archives are
+  //                      auto-extracted; every .ttf/.otf inside is installed.
+  "githubFonts": {
+    "Lemon Cookie Bold": {
+      "owner":  "googlefonts",
+      "repo":   "noto-fonts",
+      "ref":    "main",
+      "path":   "hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+      "family": "Noto Sans"
+    },
+    "Inter": {
+      "owner":        "rsms",
+      "repo":         "inter",
+      "release":      "latest",
+      "assetPattern": "Inter-*.zip"
+    }
+  },
+
+  // externalFallbacks: generic direct-URL escape hatch. Use this when
+  // none of the structured strategies above fit. URL must point at a
+  // single .ttf/.otf file.
   "externalFallbacks": {
-    "Batang":   { "name": "Noto Serif KR",         "fileName": "NotoSerifKR-Regular.ttf",         "source": "github", "url": "https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/Korean/NotoSerifCJKkr-Regular.otf" },
-    "PMingLiU": { "name": "Noto Serif TC",         "fileName": "NotoSerifTC-Regular.ttf",         "source": "github", "url": "https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/TraditionalChinese/NotoSerifCJKtc-Regular.otf" },
-    "Mangal":   { "name": "Noto Sans Devanagari",  "fileName": "NotoSansDevanagari-Regular.ttf",  "source": "github", "url": "https://github.com/notofonts/devanagari/raw/main/fonts/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Regular.ttf" }
+    // "Some Custom Font": { "name": "Some Custom Font", "fileName": "SomeFont-Regular.ttf", "url": "https://example.com/SomeFont-Regular.ttf" }
   }
 }

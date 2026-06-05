@@ -44,12 +44,23 @@ namespace PublisherConverter.GUI
             string mappingPath = System.IO.Path.Combine(System.AppContext.BaseDirectory, "FontMapping.json");
             var fontMappings = FontMappingLoader.LoadFromFile(mappingPath);
 
+            // Shared HTTP plumbing + user-fonts install pipeline. Pipeline
+            // order is intentional: Windows-native capability first, then
+            // external sources in escalating "where to get it" specificity:
+            // Google Fonts (cleanest config — just a family name), GitHub
+            // (config-driven repo/release/path), and finally the generic
+            // direct-URL fallback for one-offs.
+            var downloader = new HttpFontDownloader();
+            var installer = new WindowsUserFontInstaller(downloader);
+
             var fontResolver = new FontResolver(
                 fontCache,
                 new IFontProvisioningStrategy[]
                 {
                     new WindowsCapabilityProvisioningStrategy(fontMappings, new DefaultPowerShellRunner()),
-                    new DownloadableFontProvisioningStrategy(fontMappings, new HttpFontDownloader()),
+                    new GoogleFontsProvisioningStrategy(fontMappings, downloader, installer),
+                    new GitHubFontsProvisioningStrategy(fontMappings, downloader, installer),
+                    new DownloadableFontProvisioningStrategy(fontMappings, installer),
                 });
 
             _engine = new ConverterEngine(
