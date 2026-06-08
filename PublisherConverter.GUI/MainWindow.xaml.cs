@@ -6,6 +6,7 @@ using System.Threading;
 using System.Windows;
 using Microsoft.Win32;
 using PublisherConverter.Core;
+using PublisherConverter.Core.FontWorker;
 
 namespace PublisherConverter.GUI
 {
@@ -32,13 +33,96 @@ namespace PublisherConverter.GUI
             var manifestWriter = new ManifestWriter();
             var renderer = new PublisherLifecycleManager();
 
+            // Shared cache so the auditor and the resolver agree on
+            // installed-font state. The resolver mutates the cache after
+            // successful provisioning; the next per-file audit picks it up.
+            var fontCache = new FontAvailabilityCache(new WindowsRegistryFontProvider());
+            var fontAuditor = new FontAuditor(new PublisherFontExtractor(), fontCache);
+
+            // Mapping ships next to the GUI binary; missing/malformed file
+            // collapses to an empty table and the resolver simply finds
+            // nothing to provision.
+            string mappingPath = System.IO.Path.Combine(System.AppContext.BaseDirectory, "FontMapping.json");
+            var fontMappings = FontMappingLoader.LoadFromFile(mappingPath);
+
+            // Shared HTTP plumbing. The download/install strategies are built
+            // per cycle by the coordinator so it can pick the right install
+            // sink: system-wide via the elevated worker when elevated installs
+            // are permitted, or user-level (HKCU) otherwise. Strategy order is
+            // intentional — Google Fonts (cleanest config), then GitHub
+            // (config-driven), then the generic direct-URL fallback.
+            var downloader = new HttpFontDownloader();
+            var fontLogger = CreateMainStructuredLogger();
+
+            IReadOnlyList<IFontProvisioningStrategy> BuildDownloadStrategies(IElevatedFontWorkerClient? worker)
+            {
+                IUserFontInstaller installSink = worker != null
+                    ? new WorkerBackedFontInstaller(worker, downloader)   // system-wide via elevated worker
+                    : new WindowsUserFontInstaller(downloader);           // user-level HKCU
+                return new IFontProvisioningStrategy[]
+                {
+                    new GoogleFontsProvisioningStrategy(fontMappings, downloader, installSink),
+                    new GitHubFontsProvisioningStrategy(fontMappings, downloader, installSink),
+                    new DownloadableFontProvisioningStrategy(fontMappings, installSink),
+                };
+            }
+
+            // The worker client launches the current executable in
+            // --mode=font-worker, elevated via the "runas" verb. Capability
+            // installs are routed here as a single batch; the main process never
+            // performs privileged installation itself.
+            //
+            // The non-elevated main process owns the pipe SERVER endpoint and
+            // the elevated worker connects as the client. This is required by
+            // Windows Mandatory Integrity Control: a pipe created by the
+            // elevated worker would carry a High integrity label that blocks
+            // this Medium-integrity client from connecting. See
+            // FontWorkerHost.CreateNamedPipeHost for the full rationale.
+            IElevatedFontWorkerClient BuildWorkerClient() => new ElevatedFontWorkerClient(
+                new FontWorkerProcessLauncher(),
+                pipeName => new NamedPipeFontWorkerTransport(pipeName, isServer: true),
+                new DefaultWorkerHealthMonitor(),
+                fontLogger);
+
+            var fontService = new FontManagementService(
+                fontMappings,
+                fontCache,
+                BuildWorkerClient,
+                BuildDownloadStrategies,
+                fontLogger);
+
             _engine = new ConverterEngine(
                 inspector,
                 hashProvider,
                 manifestWriter,
                 renderer,
+                fontAuditor,
+                fontService,
                 (path, compress) => new ArchiveService(path, compress)
             );
+        }
+
+        /// <summary>
+        /// Structured log sink for the main (non-elevated) process. JSON Lines
+        /// to a per-session file under local app data; falls back to a no-op if
+        /// the file can't be opened.
+        /// </summary>
+        private static IStructuredLogger CreateMainStructuredLogger()
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "MSPub2PDF", "logs");
+                Directory.CreateDirectory(dir);
+                string path = Path.Combine(dir, $"main-{Environment.ProcessId}-{DateTime.UtcNow:yyyyMMdd_HHmmss}.jsonl");
+                var writer = new StreamWriter(path, append: true) { AutoFlush = true };
+                return new JsonLinesStructuredLogger(writer, source: "main", ownsWriter: true);
+            }
+            catch
+            {
+                return NullStructuredLogger.Instance;
+            }
         }
 
         // Folder Picker helper logic using standard Windows Dialog hooks
@@ -145,6 +229,12 @@ namespace PublisherConverter.GUI
                 MaxConsecutiveFailures = maxFailures,
                 CompressArchive = ChkCompressArchive.IsChecked ?? true,
                 FileTimeoutSeconds = timeoutSeconds,
+                EnableAutoFontInstallation = ChkEnableAutoFontInstall.IsChecked ?? false,
+                AllowElevatedFontInstallation = ChkAllowElevatedFontInstall.IsChecked ?? false,
+                MissingFontHandling = (CmbMissingFontMode.SelectedIndex == 1)
+                    ? MissingFontHandlingMode.NotifyOnly
+                    : MissingFontHandlingMode.Strict,
+                OverrideFontSkip = ChkOverrideFontSkip.IsChecked ?? false,
                 SkipSourcePaths = resuming ? new HashSet<string>(_attemptedSourcePaths, StringComparer.OrdinalIgnoreCase) : null
             };
 
@@ -226,6 +316,10 @@ namespace PublisherConverter.GUI
             TxtMaxFailures.IsEnabled = !isRunning;
             ChkCompressArchive.IsEnabled = !isRunning;
             TxtTimeout.IsEnabled = !isRunning;
+            ChkEnableAutoFontInstall.IsEnabled = !isRunning;
+            ChkAllowElevatedFontInstall.IsEnabled = !isRunning;
+            CmbMissingFontMode.IsEnabled = !isRunning;
+            ChkOverrideFontSkip.IsEnabled = !isRunning;
         }
 
         private void AppendConsoleLog(string message)

@@ -15,6 +15,19 @@ namespace PublisherConverter.Core
     }
 
     /// <summary>
+    /// How the orchestrator treats a document whose required fonts could not be
+    /// resolved after provisioning.
+    /// </summary>
+    public enum MissingFontHandlingMode
+    {
+        /// <summary>Fail the conversion when required fonts remain unresolved.</summary>
+        Strict,
+
+        /// <summary>Log the unresolved fonts and continue processing the document.</summary>
+        NotifyOnly,
+    }
+
+    /// <summary>
     /// Thrown by ConverterEngine when too many consecutive files fail and the
     /// circuit breaker halts the batch. Derives from InvalidOperationException
     /// for backwards compatibility with existing catch blocks. Callers (the GUI)
@@ -53,6 +66,15 @@ namespace PublisherConverter.Core
         public string Details { get; set; } = "Pending processing.";
         public int MissingAssetsCount { get; set; } = 0;
         public string MissingAssetsList { get; set; } = "None";
+
+        /// <summary>
+        /// Populated by the font pre-flight check when the document refers
+        /// to fonts not installed on the local system. When non-zero, the
+        /// document is rejected before it ever reaches Publisher to avoid
+        /// the export-time crash.
+        /// </summary>
+        public int MissingFontsCount { get; set; } = 0;
+        public string MissingFontsList { get; set; } = "None";
 
         /// <summary>
         /// True when the engine had to retry — i.e. at least one render
@@ -102,6 +124,44 @@ namespace PublisherConverter.Core
         public int MaxConsecutiveFailures { get; set; } = 3;
 
         public int FileTimeoutSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// When true, the orchestrator hands the per-file missing-font list
+        /// to <see cref="IFontResolver"/> before failing the document so the
+        /// resolver can attempt a best-effort install (Windows optional-font
+        /// capability and/or downloadable fallback per FontMapping.json).
+        /// Defaults to false — pre-flight rejects unresolved fonts as before.
+        /// Maps to the "Automatic Font Installation" user setting.
+        /// </summary>
+        public bool EnableAutoFontInstallation { get; set; } = false;
+
+        /// <summary>
+        /// When true, the font provisioning coordinator may launch the elevated
+        /// worker (a single UAC prompt per run) to install system-wide fonts and
+        /// Windows capabilities. When false, only user-level installs are
+        /// performed and capability-only fonts cannot be resolved. Maps to the
+        /// "Allow Elevated Font Installation" user setting. Defaults to false.
+        /// </summary>
+        public bool AllowElevatedFontInstallation { get; set; } = false;
+
+        /// <summary>
+        /// How to treat a document whose required fonts remain unresolved after
+        /// provisioning. <see cref="MissingFontHandlingMode.Strict"/> (the
+        /// default) fails the document; <see cref="MissingFontHandlingMode.NotifyOnly"/>
+        /// logs the unresolved fonts and continues. Maps to the "Missing Font
+        /// Handling Mode" user setting.
+        /// </summary>
+        public MissingFontHandlingMode MissingFontHandling { get; set; } = MissingFontHandlingMode.Strict;
+
+        /// <summary>
+        /// When true, files with still-missing fonts (after any resolution
+        /// attempt) are sent to the renderer anyway instead of being rejected.
+        /// Missing-font diagnostics on the FileRecord and in the
+        /// FontPreflightReport are preserved either way. Defaults to false —
+        /// pre-flight blocks the file as before. Equivalent to
+        /// <see cref="MissingFontHandlingMode.NotifyOnly"/> and OR-ed with it.
+        /// </summary>
+        public bool OverrideFontSkip { get; set; } = false;
 
         /// <summary>
         /// Absolute source paths to skip during discovery. The GUI's "Continue"

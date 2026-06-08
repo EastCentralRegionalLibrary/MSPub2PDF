@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using PublisherConverter.Core.FontWorker;
 
 namespace PublisherConverter.Core
 {
@@ -14,20 +15,63 @@ namespace PublisherConverter.Core
         private readonly IHashProvider _hashProvider;
         private readonly IManifestWriter _manifestWriter;
         private readonly IPublisherRenderer _renderer;
+        private readonly IFontAuditor _fontAuditor;
+        private readonly IFontResolver _fontResolver;
         private readonly Func<string, bool, IArchiveService> _archiveServiceFactory;
+
+        // Latest run's font pre-flight findings, accessible after
+        // ExecuteMigrationAsync returns so the GUI (and the automatic
+        // font-installer feature) can iterate the missing-font → files map
+        // without re-parsing log output.
+        public FontPreflightReport LatestFontPreflightReport { get; private set; } = new FontPreflightReport();
 
         public ConverterEngine(
             IFileInspector inspector,
             IHashProvider hashProvider,
             IManifestWriter manifestWriter,
             IPublisherRenderer renderer,
+            IFontAuditor fontAuditor,
+            IFontResolver fontResolver,
             Func<string, bool, IArchiveService> archiveServiceFactory)
         {
             _inspector = inspector;
             _hashProvider = hashProvider;
             _manifestWriter = manifestWriter;
             _renderer = renderer;
+            _fontAuditor = fontAuditor ?? new NoOpFontAuditor();
+            _fontResolver = fontResolver ?? new NoOpFontResolver();
             _archiveServiceFactory = archiveServiceFactory;
+        }
+
+        /// <summary>
+        /// Convenience overload: wires a NoOp resolver, suitable for callers
+        /// that don't enable EnableAutoFontInstallation.
+        /// </summary>
+        public ConverterEngine(
+            IFileInspector inspector,
+            IHashProvider hashProvider,
+            IManifestWriter manifestWriter,
+            IPublisherRenderer renderer,
+            IFontAuditor fontAuditor,
+            Func<string, bool, IArchiveService> archiveServiceFactory)
+            : this(inspector, hashProvider, manifestWriter, renderer, fontAuditor, new NoOpFontResolver(), archiveServiceFactory)
+        {
+        }
+
+        /// <summary>
+        /// Backwards-compatible constructor — wires a NoOp font auditor + NoOp
+        /// resolver so the orchestrator runs as it did before the pre-flight
+        /// feature shipped. Production callers should use the overload that
+        /// takes both IFontAuditor and IFontResolver.
+        /// </summary>
+        public ConverterEngine(
+            IFileInspector inspector,
+            IHashProvider hashProvider,
+            IManifestWriter manifestWriter,
+            IPublisherRenderer renderer,
+            Func<string, bool, IArchiveService> archiveServiceFactory)
+            : this(inspector, hashProvider, manifestWriter, renderer, new NoOpFontAuditor(), new NoOpFontResolver(), archiveServiceFactory)
+        {
         }
 
         public async Task ExecuteMigrationAsync(ConversionOptions options, IProgress<ProgressReport> progress, CancellationToken cancellationToken)
@@ -53,6 +97,25 @@ namespace PublisherConverter.Core
                 {
                     throw new InvalidOperationException($"Failed to initialize backup directory structure: {ex.Message}", ex);
                 }
+            }
+
+            // Fresh report for this run — the engine instance can be reused
+            // across multiple ExecuteMigrationAsync calls (Continue flow).
+            LatestFontPreflightReport = new FontPreflightReport();
+
+            // Open a font-provisioning cycle so a session-scoped resolver can
+            // launch its elevated worker at most once for this whole run and
+            // tear it down when the run ends (see the finally block).
+            var provisioningSession = _fontResolver as IFontProvisioningSession;
+            if (provisioningSession != null)
+            {
+                await provisioningSession.BeginCycleAsync(
+                    new FontProvisioningPolicy
+                    {
+                        AutomaticInstallEnabled = options.EnableAutoFontInstallation,
+                        AllowElevatedInstall = options.AllowElevatedFontInstallation,
+                    },
+                    cancellationToken);
             }
 
             try
@@ -142,6 +205,113 @@ namespace PublisherConverter.Core
                         continue;
                     }
                     record.SourceHash = _hashProvider.GetSha256Hash(record.OriginalFullPath);
+
+                    // Step A.5: Font Pre-flight
+                    // Publisher crashes on export when a referenced font is missing
+                    // and substitution rules aren't set. Detecting this without
+                    // opening the file lets us short-circuit with a clean failure
+                    // record and keep the worker alive. The per-file missing list
+                    // is also rolled up into LatestFontPreflightReport for the
+                    // end-of-run summary (and the future auto-installer hook).
+                    IReadOnlyList<string> missingFonts;
+                    try
+                    {
+                        missingFonts = _fontAuditor.ResolveMissingFonts(record.OriginalFullPath);
+                    }
+                    catch (Exception fontEx)
+                    {
+                        // A failure in pre-flight shouldn't block the run — log
+                        // it and proceed; the worker's own backstop still applies.
+                        reporter.Report(UpdateProgressState(report, $"Font pre-flight failed on {record.FileName}: {fontEx.Message}", record));
+                        missingFonts = Array.Empty<string>();
+                    }
+
+                    if (missingFonts.Count > 0)
+                    {
+                        // Capture the initially-missing set on the record up
+                        // front so it's preserved on every downstream branch
+                        // (auto-resolve success/failure, override allow-through).
+                        record.MissingFontsCount = missingFonts.Count;
+                        record.MissingFontsList = string.Join(" | ", missingFonts);
+
+                        IReadOnlyList<string> stillMissing = missingFonts;
+
+                        // Step A.5a: optional auto-resolve
+                        if (options.EnableAutoFontInstallation)
+                        {
+                            reporter.Report(UpdateProgressState(report, $"Auto-resolving missing font(s) for {record.FileName}: {record.MissingFontsList}", record));
+                            FontResolutionOutcome outcome;
+                            try
+                            {
+                                outcome = await _fontResolver.ResolveMissingFontsAsync(missingFonts, cancellationToken).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                throw;
+                            }
+                            catch (Exception resEx)
+                            {
+                                reporter.Report(UpdateProgressState(report, $"Font auto-resolver crashed on {record.FileName}: {resEx.Message}", record));
+                                outcome = new FontResolutionOutcome { InitiallyMissing = missingFonts, StillMissing = missingFonts };
+                            }
+
+                            foreach (var line in outcome.Log)
+                            {
+                                reporter.Report(UpdateProgressState(report, line, null));
+                            }
+
+                            stillMissing = outcome.StillMissing;
+
+                            if (outcome.Resolved.Count > 0)
+                            {
+                                // Reflect the post-resolution state on the record so
+                                // a fully-resolved file becomes a clean success while
+                                // a partial resolution still surfaces what remains.
+                                record.MissingFontsCount = stillMissing.Count;
+                                record.MissingFontsList = stillMissing.Count == 0 ? "None" : string.Join(" | ", stillMissing);
+                            }
+                        }
+
+                        if (stillMissing.Count > 0)
+                        {
+                            // Whatever remains missing gets aggregated for the
+                            // end-of-run summary regardless of override — the
+                            // GUI / future auto-installer feature needs the
+                            // mapping to know what to fetch or surface.
+                            LatestFontPreflightReport.RecordMissingFonts(record.OriginalFullPath, stillMissing);
+
+                            // Notify-Only mode continues processing unresolved
+                            // documents (logging the gap); Strict fails them. The
+                            // explicit override flag is an equivalent escape hatch.
+                            bool notifyOnly = options.MissingFontHandling == MissingFontHandlingMode.NotifyOnly;
+                            if (options.OverrideFontSkip || notifyOnly)
+                            {
+                                // Allow the file through to the renderer. Keep
+                                // MissingFontsList populated so diagnostics
+                                // survive into logs / manifest / summary.
+                                string prefix = options.OverrideFontSkip ? "Override" : "Notify-only";
+                                string reason = options.OverrideFontSkip ? "override enabled" : "notify-only mode";
+                                record.Details = $"Proceeding despite missing system font(s) [{record.MissingFontsList}] ({reason} — Publisher may crash on export).";
+                                reporter.Report(UpdateProgressState(report, $"{prefix}: rendering {record.FileName} with missing font(s) [{record.MissingFontsList}].", record));
+                                // Fall through to ingress + render.
+                            }
+                            else
+                            {
+                                record.Status = MigrationStatus.FailedConversion;
+                                record.Details = $"Pre-flight rejected: missing system font(s) [{record.MissingFontsList}] would crash Publisher on export.";
+
+                                report.FailureCount++;
+                                report.ProcessedFiles++;
+                                record.ProcessedAtUtc = DateTime.UtcNow;
+                                reporter.Report(UpdateProgressState(report, $"Skipped (font pre-flight): {record.FileName} → {record.MissingFontsList}", record));
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            reporter.Report(UpdateProgressState(report, $"Font auto-resolver: all missing fonts provisioned for {record.FileName}.", record));
+                        }
+                    }
 
                     // Step B: Ingress Staging
                     try
@@ -386,8 +556,13 @@ namespace PublisherConverter.Core
                         // first try with no retries. Anything that had a
                         // failed attempt (including degraded successes) stays
                         // put so the user can review what changed.
+                        // Only delete originals that converted cleanly with no
+                        // retries AND no outstanding missing-font diagnostics
+                        // (so override-allowed files keep their .pub even if
+                        // the renderer happened to succeed on substitutes).
                         if (record.Status == MigrationStatus.VerifiedComplete
                             && !record.HadFailedAttempt
+                            && record.MissingFontsCount == 0
                             && IsPlausiblePdf(record.FinalPdfPath))
                         {
                             try
@@ -401,6 +576,18 @@ namespace PublisherConverter.Core
                         }
                     }
                 }
+
+                // End-of-run font pre-flight summary. Emitted via the progress
+                // reporter so the GUI's console picks it up alongside per-file
+                // output. Programmatic consumers (e.g. a future auto-installer)
+                // read LatestFontPreflightReport.FilesByMissingFont directly.
+                if (LatestFontPreflightReport.HasFindings)
+                {
+                    foreach (string line in LatestFontPreflightReport.EnumerateSummaryLines())
+                    {
+                        reporter.Report(UpdateProgressState(report, line, null));
+                    }
+                }
             }
             finally
             {
@@ -412,6 +599,15 @@ namespace PublisherConverter.Core
                 catch { }
 
                 try { _renderer.Shutdown(); } catch { }
+
+                // Close the provisioning cycle: shut the elevated worker down and
+                // release its resources. Uses None so teardown still runs even if
+                // the batch was cancelled. The resolver itself stays reusable for
+                // a follow-up run (the GUI's "Continue" flow).
+                if (provisioningSession != null)
+                {
+                    try { await provisioningSession.EndCycleAsync(CancellationToken.None); } catch { }
+                }
 
                 try
                 {

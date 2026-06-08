@@ -14,4 +14,8 @@
     <PackageReference Include="MSOfficeCore.Interop" Version="15.0.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="PublisherConverter.Tests" />
+  </ItemGroup>
+
 </Project>
