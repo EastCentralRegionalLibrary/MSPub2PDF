@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using PublisherConverter.Core.FontWorker;
 
 namespace PublisherConverter.Core
 {
@@ -101,6 +102,21 @@ namespace PublisherConverter.Core
             // Fresh report for this run — the engine instance can be reused
             // across multiple ExecuteMigrationAsync calls (Continue flow).
             LatestFontPreflightReport = new FontPreflightReport();
+
+            // Open a font-provisioning cycle so a session-scoped resolver can
+            // launch its elevated worker at most once for this whole run and
+            // tear it down when the run ends (see the finally block).
+            var provisioningSession = _fontResolver as IFontProvisioningSession;
+            if (provisioningSession != null)
+            {
+                await provisioningSession.BeginCycleAsync(
+                    new FontProvisioningPolicy
+                    {
+                        AutomaticInstallEnabled = options.EnableAutoFontInstallation,
+                        AllowElevatedInstall = options.AllowElevatedFontInstallation,
+                    },
+                    cancellationToken);
+            }
 
             try
             {
@@ -264,13 +280,19 @@ namespace PublisherConverter.Core
                             // mapping to know what to fetch or surface.
                             LatestFontPreflightReport.RecordMissingFonts(record.OriginalFullPath, stillMissing);
 
-                            if (options.OverrideFontSkip)
+                            // Notify-Only mode continues processing unresolved
+                            // documents (logging the gap); Strict fails them. The
+                            // explicit override flag is an equivalent escape hatch.
+                            bool notifyOnly = options.MissingFontHandling == MissingFontHandlingMode.NotifyOnly;
+                            if (options.OverrideFontSkip || notifyOnly)
                             {
                                 // Allow the file through to the renderer. Keep
                                 // MissingFontsList populated so diagnostics
                                 // survive into logs / manifest / summary.
-                                record.Details = $"Proceeding despite missing system font(s) [{record.MissingFontsList}] (override enabled — Publisher may crash on export).";
-                                reporter.Report(UpdateProgressState(report, $"Override: rendering {record.FileName} with missing font(s) [{record.MissingFontsList}].", record));
+                                string prefix = options.OverrideFontSkip ? "Override" : "Notify-only";
+                                string reason = options.OverrideFontSkip ? "override enabled" : "notify-only mode";
+                                record.Details = $"Proceeding despite missing system font(s) [{record.MissingFontsList}] ({reason} — Publisher may crash on export).";
+                                reporter.Report(UpdateProgressState(report, $"{prefix}: rendering {record.FileName} with missing font(s) [{record.MissingFontsList}].", record));
                                 // Fall through to ingress + render.
                             }
                             else
@@ -577,6 +599,15 @@ namespace PublisherConverter.Core
                 catch { }
 
                 try { _renderer.Shutdown(); } catch { }
+
+                // Close the provisioning cycle: shut the elevated worker down and
+                // release its resources. Uses None so teardown still runs even if
+                // the batch was cancelled. The resolver itself stays reusable for
+                // a follow-up run (the GUI's "Continue" flow).
+                if (provisioningSession != null)
+                {
+                    try { await provisioningSession.EndCycleAsync(CancellationToken.None); } catch { }
+                }
 
                 try
                 {

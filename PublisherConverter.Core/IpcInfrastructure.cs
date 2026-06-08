@@ -1,5 +1,4 @@
 using System;
-using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -10,21 +9,17 @@ using System.Threading.Tasks;
 namespace PublisherConverter.Core
 {
     /// <summary>
-    /// Length-prefixed JSON message transport over a named pipe.
-    ///
-    /// Wire format: a single message is [4-byte little-endian length][UTF-8 JSON payload].
-    /// We can't use JsonSerializer.(Des)erializeAsync directly on a PipeStream because
-    /// the deserializer keeps reading until its buffer fills past a threshold OR the
-    /// stream returns EOF — neither happens on a long-lived duplex pipe, so it blocks
-    /// indefinitely even after a complete JSON value has arrived. Framing each message
-    /// with its byte length lets us read exactly the right number of bytes.
+    /// Length-prefixed JSON message transport over a named pipe for the
+    /// Publisher render worker. The byte-level framing lives in
+    /// <see cref="PipeMessageFraming"/> and is shared with the elevated font
+    /// worker transport; this class is responsible only for connection setup
+    /// and (de)serializing <see cref="WorkerRequest"/>/<see cref="WorkerResponse"/>.
     /// </summary>
     public class NamedPipeWorkerTransport : IWorkerTransport
     {
         private const int DefaultServerWaitTimeoutMs = 30000;
         private const int DefaultClientConnectionTimeoutMs = 10000;
         private const int ConnectionRetryIntervalMs = 100;
-        private const int MaxMessageBytes = 16 * 1024 * 1024; // 16 MiB safety cap
 
         private readonly string _pipeName;
         private readonly bool _isServer;
@@ -94,26 +89,26 @@ namespace PublisherConverter.Core
         public async Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken)
         {
             if (_stream == null) throw new InvalidOperationException("Transport not connected.");
-            await WriteFramedAsync(_stream, JsonSerializer.SerializeToUtf8Bytes(request), cancellationToken).ConfigureAwait(false);
+            await PipeMessageFraming.WriteFramedAsync(_stream, JsonSerializer.SerializeToUtf8Bytes(request), cancellationToken).ConfigureAwait(false);
         }
 
         public async Task SendResponseAsync(WorkerResponse response, CancellationToken cancellationToken)
         {
             if (_stream == null) throw new InvalidOperationException("Transport not connected.");
-            await WriteFramedAsync(_stream, JsonSerializer.SerializeToUtf8Bytes(response), cancellationToken).ConfigureAwait(false);
+            await PipeMessageFraming.WriteFramedAsync(_stream, JsonSerializer.SerializeToUtf8Bytes(response), cancellationToken).ConfigureAwait(false);
         }
 
         public async Task<WorkerRequest?> ReceiveRequestAsync(CancellationToken cancellationToken)
         {
             if (_stream == null) throw new InvalidOperationException("Transport not connected.");
-            byte[]? payload = await ReadFramedAsync(_stream, cancellationToken).ConfigureAwait(false);
+            byte[]? payload = await PipeMessageFraming.ReadFramedAsync(_stream, cancellationToken).ConfigureAwait(false);
             return payload == null ? null : JsonSerializer.Deserialize<WorkerRequest>(payload);
         }
 
         public async Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
         {
             if (_stream == null) throw new InvalidOperationException("Transport not connected.");
-            byte[]? payload = await ReadFramedAsync(_stream, cancellationToken).ConfigureAwait(false);
+            byte[]? payload = await PipeMessageFraming.ReadFramedAsync(_stream, cancellationToken).ConfigureAwait(false);
             if (payload == null) throw new InvalidOperationException("Worker closed the pipe before sending a response.");
             return JsonSerializer.Deserialize<WorkerResponse>(payload)
                    ?? throw new InvalidOperationException("Received null response from worker.");
@@ -124,105 +119,19 @@ namespace PublisherConverter.Core
         public void SendResponseSync(WorkerResponse response)
         {
             if (_stream == null) throw new InvalidOperationException("Transport not connected.");
-            WriteFramed(_stream, JsonSerializer.SerializeToUtf8Bytes(response));
+            PipeMessageFraming.WriteFramed(_stream, JsonSerializer.SerializeToUtf8Bytes(response));
         }
 
         public WorkerRequest? ReceiveRequestSync()
         {
             if (_stream == null) throw new InvalidOperationException("Transport not connected.");
-            byte[]? payload = ReadFramed(_stream);
+            byte[]? payload = PipeMessageFraming.ReadFramed(_stream);
             return payload == null ? null : JsonSerializer.Deserialize<WorkerRequest>(payload);
         }
 
         public void Dispose()
         {
             _stream?.Dispose();
-        }
-
-        // -----------------------------
-        // Framing helpers
-        // -----------------------------
-
-        private static async Task WriteFramedAsync(PipeStream stream, byte[] payload, CancellationToken cancellationToken)
-        {
-            byte[] header = new byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
-            await stream.WriteAsync(header.AsMemory(), cancellationToken).ConfigureAwait(false);
-            await stream.WriteAsync(payload.AsMemory(), cancellationToken).ConfigureAwait(false);
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        private static void WriteFramed(PipeStream stream, byte[] payload)
-        {
-            Span<byte> header = stackalloc byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
-            stream.Write(header);
-            stream.Write(payload, 0, payload.Length);
-            stream.Flush();
-        }
-
-        private static async Task<byte[]?> ReadFramedAsync(PipeStream stream, CancellationToken cancellationToken)
-        {
-            byte[] header = new byte[4];
-            if (!await TryReadExactlyAsync(stream, header, cancellationToken).ConfigureAwait(false)) return null;
-
-            int length = BinaryPrimitives.ReadInt32LittleEndian(header);
-            if (length < 0 || length > MaxMessageBytes)
-            {
-                throw new InvalidDataException($"Refusing to read framed message of declared size {length}.");
-            }
-            if (length == 0) return Array.Empty<byte>();
-
-            byte[] payload = new byte[length];
-            if (!await TryReadExactlyAsync(stream, payload, cancellationToken).ConfigureAwait(false))
-            {
-                throw new EndOfStreamException("Pipe closed mid-message.");
-            }
-            return payload;
-        }
-
-        private static byte[]? ReadFramed(PipeStream stream)
-        {
-            byte[] header = new byte[4];
-            if (!TryReadExactly(stream, header)) return null;
-
-            int length = BinaryPrimitives.ReadInt32LittleEndian(header);
-            if (length < 0 || length > MaxMessageBytes)
-            {
-                throw new InvalidDataException($"Refusing to read framed message of declared size {length}.");
-            }
-            if (length == 0) return Array.Empty<byte>();
-
-            byte[] payload = new byte[length];
-            if (!TryReadExactly(stream, payload))
-            {
-                throw new EndOfStreamException("Pipe closed mid-message.");
-            }
-            return payload;
-        }
-
-        private static async Task<bool> TryReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
-        {
-            int total = 0;
-            while (total < buffer.Length)
-            {
-                int read = await stream.ReadAsync(buffer.AsMemory(total), cancellationToken).ConfigureAwait(false);
-                if (read == 0) return total == 0 ? false : throw new EndOfStreamException("Pipe closed mid-message.");
-                total += read;
-            }
-            return true;
-        }
-
-        private static bool TryReadExactly(Stream stream, byte[] buffer)
-        {
-            int total = 0;
-            while (total < buffer.Length)
-            {
-                int read = stream.Read(buffer, total, buffer.Length - total);
-                if (read == 0) return total == 0 ? false : throw new EndOfStreamException("Pipe closed mid-message.");
-                total += read;
-            }
-            return true;
         }
     }
 
