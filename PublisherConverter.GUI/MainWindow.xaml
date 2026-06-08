@@ -111,6 +111,31 @@
                           VerticalAlignment="Center"
                           FontWeight="Normal"
                           ToolTip="When checked, the orchestrator tries Windows optional-font capabilities and/or downloadable fallbacks from FontMapping.json before failing a file for missing fonts."/>
+                <CheckBox x:Name="ChkAllowElevatedFontInstall"
+                          Content="Allow elevated (system-wide) font install"
+                          IsChecked="False"
+                          Margin="0,0,25,0"
+                          VerticalAlignment="Center"
+                          FontWeight="Normal"
+                          ToolTip="When checked, a single elevated worker (one UAC prompt per run) installs Windows font capabilities and system-wide fonts. When unchecked, only user-level installs are performed and capability-only fonts cannot be resolved. The main application never runs elevated."/>
+                <StackPanel Orientation="Horizontal"
+                            VerticalAlignment="Center"
+                            Margin="0,0,25,0">
+                    <TextBlock Text="Missing fonts:"
+                               VerticalAlignment="Center"
+                               Margin="0,0,5,0"
+                               FontWeight="Normal"/>
+                    <ComboBox x:Name="CmbMissingFontMode"
+                              Width="150"
+                              Height="24"
+                              SelectedIndex="0"
+                              VerticalContentAlignment="Center"
+                              FontWeight="Normal"
+                              ToolTip="Strict fails a document whose required fonts can't be resolved. Notify Only logs the unresolved fonts and continues processing.">
+                        <ComboBoxItem Content="Strict (fail)"/>
+                        <ComboBoxItem Content="Notify Only (continue)"/>
+                    </ComboBox>
+                </StackPanel>
                 <CheckBox x:Name="ChkOverrideFontSkip"
                           Content="Force convert even with missing fonts"
                           IsChecked="False"
