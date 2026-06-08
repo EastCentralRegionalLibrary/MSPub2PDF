@@ -40,8 +40,19 @@ namespace PublisherConverter.Core.FontWorker
         }
 
         /// <summary>
-        /// Convenience factory for the production entry point: binds a named
-        /// pipe server transport for <paramref name="pipeName"/>.
+        /// Convenience factory for the production entry point. The elevated
+        /// worker connects as the named-pipe <em>client</em>; the non-elevated
+        /// main process owns the server endpoint.
+        ///
+        /// This orientation is deliberate and load-bearing. Under Windows
+        /// Mandatory Integrity Control, an object created by an elevated (High
+        /// integrity) process is stamped with a High mandatory label, and the
+        /// "no write up" policy then blocks a Medium-integrity client (the
+        /// standard-user GUI) from connecting — Access Denied. By making the
+        /// low-integrity main process the server and the elevated worker the
+        /// client, the higher-integrity worker freely opens the lower-integrity
+        /// pipe (writing "down" is always permitted), with no custom security
+        /// descriptors / P/Invoke required.
         /// </summary>
         public static FontWorkerHost CreateNamedPipeHost(
             string pipeName,
@@ -49,7 +60,7 @@ namespace PublisherConverter.Core.FontWorker
             IStructuredLogger? logger = null,
             IPrivilegeChecker? privilegeChecker = null)
         {
-            return new FontWorkerHost(new NamedPipeFontWorkerTransport(pipeName, isServer: true), installer, logger, privilegeChecker);
+            return new FontWorkerHost(new NamedPipeFontWorkerTransport(pipeName, isServer: false), installer, logger, privilegeChecker);
         }
 
         /// <summary>

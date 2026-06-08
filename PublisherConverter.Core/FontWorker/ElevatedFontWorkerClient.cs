@@ -11,6 +11,13 @@ namespace PublisherConverter.Core.FontWorker
     /// serialized starts, serialized IPC, per-request timeouts, and teardown on
     /// any failure. All collaborators are injected, so the whole client is
     /// exercised on Linux with fakes — no elevation, pipes, or Windows APIs.
+    ///
+    /// Transport orientation: this client lives in the non-elevated main
+    /// process and is wired with a <em>server</em> transport, while the elevated
+    /// worker connects as the client. That inversion is required by Windows
+    /// Mandatory Integrity Control — see FontWorkerHost.CreateNamedPipeHost.
+    /// The client itself is transport-agnostic; the orientation is a wiring
+    /// decision made by the injected transport factory.
     /// </summary>
     public sealed class ElevatedFontWorkerClient : IElevatedFontWorkerClient
     {

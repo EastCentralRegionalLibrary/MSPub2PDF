@@ -71,9 +71,16 @@ namespace PublisherConverter.GUI
             // --mode=font-worker, elevated via the "runas" verb. Capability
             // installs are routed here as a single batch; the main process never
             // performs privileged installation itself.
+            //
+            // The non-elevated main process owns the pipe SERVER endpoint and
+            // the elevated worker connects as the client. This is required by
+            // Windows Mandatory Integrity Control: a pipe created by the
+            // elevated worker would carry a High integrity label that blocks
+            // this Medium-integrity client from connecting. See
+            // FontWorkerHost.CreateNamedPipeHost for the full rationale.
             IElevatedFontWorkerClient BuildWorkerClient() => new ElevatedFontWorkerClient(
                 new FontWorkerProcessLauncher(),
-                pipeName => new NamedPipeFontWorkerTransport(pipeName),
+                pipeName => new NamedPipeFontWorkerTransport(pipeName, isServer: true),
                 new DefaultWorkerHealthMonitor(),
                 fontLogger);
 
