@@ -1,0 +1,147 @@
+{
+  // FontSources.json — the central, data-driven registry for the layered font
+  // acquisition fallback chain. Onboarding or retargeting a source should be a
+  // change HERE, not in resolver code.
+  //
+  // Layer order (strict, stop on first success per font):
+  //   1. local cache + scratch + Microsoft Features on Demand   (trusted, offline-first)
+  //   2. googleFonts   — repository-backed static .ttf (google/fonts)
+  //   3. vendorRepo    — smart-routed official upstreams (IBM Plex, JetBrains, Adobe Source)
+  //   4. community     — DaFont, license-gated, last resort
+  //
+  // Only static .ttf payloads are ever installed.
+
+  "policy": {
+    "enabledLayers": [ "localCache", "scratch", "featuresOnDemand", "googleFonts", "vendorRepo", "community" ],
+    "communityEnabled": true,
+    "allowlistedVendors": [],
+    "probeTimeoutMs": 3000,
+    "downloadTimeoutMs": 60000,
+    "license": {
+      "autoInstallNonMicrosoft": true,
+      "allowedKeywords": [
+        "SIL Open Font License", "OFL", "Apache License", "Apache-2.0",
+        "Ubuntu Font License", "UFL", "MIT License"
+      ],
+      "manualReviewKeywords": [
+        "free for personal use", "personal use only", "donationware", "demo", "shareware"
+      ],
+      "rejectKeywords": [
+        "no redistribution", "commercial use prohibited", "all rights reserved"
+      ],
+      "unknownLicenseAction": "manualReviewRequired"
+    }
+  },
+
+  // Requested family → canonical family (matched case/space/punct-insensitively).
+  "aliases": {
+    "Source Sans Pro": "Source Sans 3",
+    "Source Serif Pro": "Source Serif 4"
+  },
+
+  // Extra style tokens stripped from a requested name before resolution (the
+  // normalizer also knows the common weights/slants by default).
+  "styleSuffixes": [
+    "Regular", "Italic", "Bold", "Bold Italic", "Oblique",
+    "Medium", "SemiBold", "Semibold", "DemiBold", "Light", "Thin",
+    "Black", "Heavy", "ExtraBold", "ExtraLight"
+  ],
+
+  "sources": [
+    {
+      "id": "google-fonts",
+      "type": "googleFonts",
+      "enabled": true,
+      "priority": 20,
+      "rawBaseUrl": "https://raw.githubusercontent.com",
+      "repo": { "owner": "google", "repo": "fonts", "branch": "main" },
+      "licenseDirs": [ "ofl", "apache", "ufl" ],
+      "pathTemplates": [
+        "{licenseDir}/{slug}/static/{FamilyNoSpace}-{Style}.ttf",
+        "{licenseDir}/{slug}/{FamilyNoSpace}-{Style}.ttf"
+      ],
+      "styles": [ "Regular", "Bold", "Italic", "BoldItalic" ],
+      "supportedExtensions": [ ".ttf" ],
+      "licenseHint": "SIL Open Font License (OFL)"
+    },
+
+    {
+      "id": "ibm-plex",
+      "type": "vendorRepo",
+      "enabled": true,
+      "priority": 30,
+      "routingPatterns": [ "ibm", "plex" ],
+      "rawBaseUrl": "https://raw.githubusercontent.com",
+      "repo": { "owner": "IBM", "repo": "plex", "branch": "master" },
+      "pathTemplates": [
+        "IBM-Plex-Sans/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf",
+        "IBM-Plex-Serif/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf",
+        "IBM-Plex-Mono/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf"
+      ],
+      "styles": [ "Regular", "Bold", "Italic", "BoldItalic" ],
+      "supportedExtensions": [ ".ttf" ],
+      "licenseHint": "SIL Open Font License (OFL)"
+    },
+
+    {
+      "id": "jetbrains-mono",
+      "type": "vendorRepo",
+      "enabled": true,
+      "priority": 31,
+      "routingPatterns": [ "jetbrains" ],
+      "apiBaseUrl": "https://api.github.com",
+      "repo": { "owner": "JetBrains", "repo": "JetBrainsMono", "branch": "master", "releaseAssetPattern": "JetBrainsMono-*.zip" },
+      "archive": {
+        "extractExtensions": [ ".ttf" ],
+        "ttfPathHints": [ "fonts/ttf/" ],
+        "licenseFileNames": [ "OFL.txt", "LICENSE", "LICENSE.txt" ]
+      },
+      "supportedExtensions": [ ".ttf" ],
+      "licenseHint": "SIL Open Font License (OFL)"
+    },
+
+    {
+      "id": "adobe-source-sans",
+      "type": "vendorRepo",
+      "enabled": true,
+      "priority": 32,
+      "routingPatterns": [ "source\\s?sans", "adobe" ],
+      "rawBaseUrl": "https://raw.githubusercontent.com",
+      "repo": { "owner": "adobe-fonts", "repo": "source-sans", "branch": "release" },
+      "pathTemplates": [ "TTF/{FamilyNoSpace}-{Style}.ttf" ],
+      "styles": [ "Regular", "Bold", "It", "BoldIt" ],
+      "supportedExtensions": [ ".ttf" ],
+      "licenseHint": "SIL Open Font License (OFL)"
+    },
+
+    {
+      "id": "adobe-source-code",
+      "type": "vendorRepo",
+      "enabled": true,
+      "priority": 33,
+      "routingPatterns": [ "source\\s?code" ],
+      "rawBaseUrl": "https://raw.githubusercontent.com",
+      "repo": { "owner": "adobe-fonts", "repo": "source-code-pro", "branch": "release" },
+      "pathTemplates": [ "TTF/{FamilyNoSpace}-{Style}.ttf" ],
+      "styles": [ "Regular", "Bold", "It", "BoldIt" ],
+      "supportedExtensions": [ ".ttf" ],
+      "licenseHint": "SIL Open Font License (OFL)"
+    },
+
+    {
+      "id": "dafont",
+      "type": "community",
+      "enabled": true,
+      "priority": 90,
+      "baseUrl": "https://www.dafont.com",
+      "slugTemplate": "https://dl.dafont.com/dl/?f={slug}",
+      "searchTemplate": "https://www.dafont.com/search.php?q={query}",
+      "probeStrategy": "slugThenSearch",
+      "archive": {
+        "extractExtensions": [ ".ttf" ],
+        "licenseFileNames": [ "readme.txt", "license.txt", "info.txt", "read me.txt" ]
+      },
+      "supportedExtensions": [ ".ttf" ]
+    }
+  ]
+}

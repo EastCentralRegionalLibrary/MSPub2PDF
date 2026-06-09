@@ -7,6 +7,7 @@ using System.Windows;
 using Microsoft.Win32;
 using PublisherConverter.Core;
 using PublisherConverter.Core.FeaturesOnDemand;
+using PublisherConverter.Core.FontSources;
 using PublisherConverter.Core.FontWorker;
 
 namespace PublisherConverter.GUI
@@ -62,16 +63,13 @@ namespace PublisherConverter.GUI
                 ? new WorkerBackedFontInstaller(worker, downloader)
                 : new WindowsUserFontInstaller(downloader);
 
-            IReadOnlyList<IFontProvisioningStrategy> BuildDownloadStrategies(IElevatedFontWorkerClient? worker)
-            {
-                IUserFontInstaller installSink = BuildInstaller(worker);
-                return new IFontProvisioningStrategy[]
-                {
-                    new GoogleFontsProvisioningStrategy(fontMappings, downloader, installSink),
-                    new GitHubFontsProvisioningStrategy(fontMappings, downloader, installSink),
-                    new DownloadableFontProvisioningStrategy(fontMappings, installSink),
-                };
-            }
+            // Microsoft Layer 1 only — Windows capability installs + Features on
+            // Demand CABs. Non-Microsoft remote acquisition (Google Fonts, vendor
+            // repos, community) is owned by the FontSourceOrchestrator below, which
+            // is .ttf-only and license-gated; the legacy per-strategy walk is
+            // retired from the active path.
+            IReadOnlyList<IFontProvisioningStrategy> NoDownloadStrategies(IElevatedFontWorkerClient? worker)
+                => System.Array.Empty<IFontProvisioningStrategy>();
 
             // Features-on-Demand fallback pipeline. Reuses the shared HTTP
             // downloader and runs cross-platform verification/extraction (native
@@ -106,11 +104,17 @@ namespace PublisherConverter.GUI
                 fontMappings,
                 fontCache,
                 BuildWorkerClient,
-                BuildDownloadStrategies,
+                NoDownloadStrategies,
                 fontLogger,
                 requestTimeoutSeconds: null,
                 fodPipeline: fodPipeline,
                 fodInstallerFactory: BuildInstaller);
+
+            // Wrap the Microsoft layer in the layered, config-driven acquisition
+            // chain (Google Fonts → vendor repos → community), all .ttf-only and
+            // license-gated. A bad/missing FontSources.json degrades gracefully to
+            // Microsoft-only rather than taking down startup.
+            IFontResolver fontResolver = BuildFontResolver(fontService, fontCache, downloader, fontLogger);
 
             _engine = new ConverterEngine(
                 inspector,
@@ -118,9 +122,56 @@ namespace PublisherConverter.GUI
                 manifestWriter,
                 renderer,
                 fontAuditor,
-                fontService,
+                fontResolver,
                 (path, compress) => new ArchiveService(path, compress)
             );
+        }
+
+        /// <summary>
+        /// Builds the layered font acquisition chain from FontSources.json,
+        /// wrapping the Microsoft-owned layer. If the registry is missing or
+        /// malformed the failure is surfaced and the app falls back to
+        /// Microsoft-only acquisition so a config error never blocks startup.
+        /// </summary>
+        private static IFontResolver BuildFontResolver(
+            IFontResolver microsoftLayer,
+            FontAvailabilityCache cache,
+            HttpFontDownloader downloader,
+            IStructuredLogger logger)
+        {
+            string sourcesPath = Path.Combine(AppContext.BaseDirectory, "FontSources.json");
+            FontSourceConfiguration config;
+            try
+            {
+                config = FontSourceConfiguration.LoadFromFile(sourcesPath);
+            }
+            catch (FontSourceConfigurationException ex)
+            {
+                MessageBox.Show(
+                    $"FontSources.json could not be loaded:\n\n{ex.Message}\n\nRemote font sources are disabled for this session.",
+                    "Font sources configuration",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return microsoftLayer;
+            }
+
+            var http = new HttpFontClient();
+            var license = new FontLicenseEvaluator(config.Policy.License);
+            var archive = new FontArchiveInspector();
+            var normalizer = new FontFamilyNormalizer(config);
+
+            var resolvers = new List<IFontSourceResolver>
+            {
+                new LocalFontResolver(cache, config, logger),
+                new GoogleFontsResolver(config, http, license, logger),
+                new VendorRepoResolver(config, http, archive, license, logger),
+                new CommunityFontResolver(config, http, archive, license, logger),
+            };
+
+            // Non-Microsoft .ttf payloads install per-user (HKCU) — no elevation.
+            Func<IUserFontInstaller> userInstaller = () => new WindowsUserFontInstaller(downloader);
+
+            return new FontSourceOrchestrator(microsoftLayer, resolvers, normalizer, cache, userInstaller, config, logger);
         }
 
         /// <summary>
