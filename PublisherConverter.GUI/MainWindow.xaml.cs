@@ -6,6 +6,7 @@ using System.Threading;
 using System.Windows;
 using Microsoft.Win32;
 using PublisherConverter.Core;
+using PublisherConverter.Core.FeaturesOnDemand;
 using PublisherConverter.Core.FontWorker;
 
 namespace PublisherConverter.GUI
@@ -54,11 +55,16 @@ namespace PublisherConverter.GUI
             var downloader = new HttpFontDownloader();
             var fontLogger = CreateMainStructuredLogger();
 
+            // Install-sink selection shared by the download strategies and the
+            // Features-on-Demand fallback: system-wide via the elevated worker
+            // when one is live, user-level HKCU otherwise.
+            IUserFontInstaller BuildInstaller(IElevatedFontWorkerClient? worker) => worker != null
+                ? new WorkerBackedFontInstaller(worker, downloader)
+                : new WindowsUserFontInstaller(downloader);
+
             IReadOnlyList<IFontProvisioningStrategy> BuildDownloadStrategies(IElevatedFontWorkerClient? worker)
             {
-                IUserFontInstaller installSink = worker != null
-                    ? new WorkerBackedFontInstaller(worker, downloader)   // system-wide via elevated worker
-                    : new WindowsUserFontInstaller(downloader);           // user-level HKCU
+                IUserFontInstaller installSink = BuildInstaller(worker);
                 return new IFontProvisioningStrategy[]
                 {
                     new GoogleFontsProvisioningStrategy(fontMappings, downloader, installSink),
@@ -66,6 +72,18 @@ namespace PublisherConverter.GUI
                     new DownloadableFontProvisioningStrategy(fontMappings, installSink),
                 };
             }
+
+            // Features-on-Demand fallback pipeline. Reuses the shared HTTP
+            // downloader and runs cross-platform verification/extraction (native
+            // WinVerifyTrust + expand.exe on Windows). Stateless and reusable, so
+            // it is built once and handed the per-cycle install sink at run time.
+            var fodPipeline = new FeaturesOnDemandFontPipeline(
+                new FontLanguageResolver(fontMappings),
+                new UupDumpClient(downloader, fontLogger),
+                downloader,
+                new CrossPlatformCabSignatureVerifier(fontLogger),
+                new CrossPlatformCabFontExtractor(),
+                fontLogger);
 
             // The worker client launches the current executable in
             // --mode=font-worker, elevated via the "runas" verb. Capability
@@ -89,7 +107,10 @@ namespace PublisherConverter.GUI
                 fontCache,
                 BuildWorkerClient,
                 BuildDownloadStrategies,
-                fontLogger);
+                fontLogger,
+                requestTimeoutSeconds: null,
+                fodPipeline: fodPipeline,
+                fodInstallerFactory: BuildInstaller);
 
             _engine = new ConverterEngine(
                 inspector,

@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using PublisherConverter.Core.FeaturesOnDemand;
 
 namespace PublisherConverter.Core.FontWorker
 {
@@ -35,6 +37,15 @@ namespace PublisherConverter.Core.FontWorker
         private readonly IStructuredLogger _logger;
         private readonly int? _requestTimeoutSeconds;
 
+        // Optional Features-on-Demand fallback. When wired, fonts that the
+        // capability install and downloadable strategies could not resolve are
+        // routed through the batched FoD pipeline as a last resort. The installer
+        // factory mirrors _downloadStrategyFactory's install-sink selection so the
+        // FoD install lands system-wide (via the worker) or user-level to match.
+        private readonly IFeaturesOnDemandFontPipeline? _fodPipeline;
+        private readonly Func<IElevatedFontWorkerClient?, IUserFontInstaller>? _fodInstallerFactory;
+        private readonly FeaturesOnDemandOptions _fodOptions;
+
         private readonly object _cycleLock = new object();
 
         // Per-cycle state. Reset by BeginCycleAsync, torn down by EndCycleAsync.
@@ -60,7 +71,10 @@ namespace PublisherConverter.Core.FontWorker
             Func<IElevatedFontWorkerClient> workerClientFactory,
             Func<IElevatedFontWorkerClient?, IReadOnlyList<IFontProvisioningStrategy>> downloadStrategyFactory,
             IStructuredLogger? logger = null,
-            int? requestTimeoutSeconds = null)
+            int? requestTimeoutSeconds = null,
+            IFeaturesOnDemandFontPipeline? fodPipeline = null,
+            Func<IElevatedFontWorkerClient?, IUserFontInstaller>? fodInstallerFactory = null,
+            FeaturesOnDemandOptions? fodOptions = null)
         {
             _mappings = mappings ?? throw new ArgumentNullException(nameof(mappings));
             _cache = cache ?? throw new ArgumentNullException(nameof(cache));
@@ -68,6 +82,9 @@ namespace PublisherConverter.Core.FontWorker
             _downloadStrategyFactory = downloadStrategyFactory ?? throw new ArgumentNullException(nameof(downloadStrategyFactory));
             _logger = logger ?? NullStructuredLogger.Instance;
             _requestTimeoutSeconds = requestTimeoutSeconds;
+            _fodPipeline = fodPipeline;
+            _fodInstallerFactory = fodInstallerFactory;
+            _fodOptions = fodOptions ?? FeaturesOnDemandOptions.Default;
         }
 
         public Task BeginCycleAsync(FontProvisioningPolicy policy, CancellationToken cancellationToken)
@@ -197,19 +214,65 @@ namespace PublisherConverter.Core.FontWorker
 
             log.AddRange(innerOutcome.Log);
 
+            var resolved = new List<string>(innerOutcome.Resolved);
+            var stillMissing = new List<string>(innerOutcome.StillMissing);
+
+            // Phase 3c — Features-on-Demand fallback. Anything the capability
+            // install and downloadable strategies left unresolved is routed, as a
+            // single batch, through the FoD pipeline (download + verify + extract
+            // + install Microsoft LanguageFeatures font CABs).
+            if (_fodPipeline != null && _fodInstallerFactory != null && stillMissing.Count > 0)
+            {
+                var fodResolved = await RunFeaturesOnDemandAsync(stillMissing, clientForStrategies, correlationId, log, cancellationToken).ConfigureAwait(false);
+                if (fodResolved.Count > 0)
+                {
+                    foreach (var font in fodResolved) _cache.MarkInstalled(font);
+                    resolved.AddRange(stillMissing.Where(f => fodResolved.Contains(f)));
+                    stillMissing = stillMissing.Where(f => !fodResolved.Contains(f)).ToList();
+                }
+            }
+
             _logger.Info("provision.complete", correlationId, Fields(
                 ("missing", input.Count),
-                ("resolved", innerOutcome.Resolved.Count),
-                ("stillMissing", innerOutcome.StillMissing.Count),
+                ("resolved", resolved.Count),
+                ("stillMissing", stillMissing.Count),
                 ("elevated", elevatedDownload)));
 
             return new FontResolutionOutcome
             {
                 InitiallyMissing = input,
-                Resolved = innerOutcome.Resolved,
-                StillMissing = innerOutcome.StillMissing,
+                Resolved = resolved,
+                StillMissing = stillMissing,
                 Log = log,
             };
+        }
+
+        private async Task<HashSet<string>> RunFeaturesOnDemandAsync(
+            IReadOnlyList<string> stillMissing,
+            IElevatedFontWorkerClient? worker,
+            string correlationId,
+            IList<string> log,
+            CancellationToken cancellationToken)
+        {
+            var resolved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                var installer = _fodInstallerFactory!(worker);
+                var result = await _fodPipeline!.RunAsync(stillMissing, installer, _fodOptions, correlationId, null, cancellationToken).ConfigureAwait(false);
+                foreach (var line in result.Log) log.Add(line);
+                foreach (var font in result.Resolved) resolved.Add(font);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // FoD is a best-effort last resort — never let it fault the batch.
+                log.Add($"! Features-on-Demand fallback failed: {ex.Message}");
+                _logger.Error("provision.fod_failed", correlationId, Fields(("error", ex.Message)));
+            }
+            return resolved;
         }
 
         private async Task<bool> EnsureWorkerAsync(string correlationId, IList<string> log, CancellationToken cancellationToken)

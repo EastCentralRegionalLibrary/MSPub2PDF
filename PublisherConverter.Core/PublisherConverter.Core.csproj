@@ -12,6 +12,12 @@
     <PackageReference Include="Interop.Microsoft.Office.Interop.Publisher" Version="2.2.0" />
     <PackageReference Include="OpenMcdf" Version="2.3.1" />
     <PackageReference Include="MSOfficeCore.Interop" Version="15.0.2" />
+    <!--
+      In-box at runtime on .NET 8, but the compile-time reference assembly for
+      SignedCms (used by the cross-platform CAB signature verifier) ships in this
+      Microsoft BCL package. It carries no extra runtime payload.
+    -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="8.0.1" />
   </ItemGroup>
 
   <ItemGroup>
