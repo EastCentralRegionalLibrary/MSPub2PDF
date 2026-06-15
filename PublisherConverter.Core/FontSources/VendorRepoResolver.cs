@@ -152,7 +152,7 @@ namespace PublisherConverter.Core.FontSources
             string requestedToken = FontFamilyNormalizer.StyleFileToken(request.RequestedStyles);
             foreach (var font in matches)
             {
-                var outcome = await FinalizeTtfAsync(request, source.Id, assetUrl, font.Data, license, 0.85, StyleOf(font.EntryName, requestedToken), context, cancellationToken).ConfigureAwait(false);
+                var outcome = await FinalizeTtfAsync(request, source.Id, assetUrl, font.Data, license, 0.85, StyleOf(font.EntryName, requestedToken), context, cancellationToken, inspection.LicenseText).ConfigureAwait(false);
                 if (outcome.IsResolved && primary == null) primary = outcome;
             }
             return primary ?? FontAcquisitionResult.Miss(request, Layer, "archive .ttf install failed");

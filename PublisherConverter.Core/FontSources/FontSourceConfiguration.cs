@@ -140,6 +140,12 @@ namespace PublisherConverter.Core.FontSources
         // Community templates with {slug} / {query} placeholders.
         public string? SlugTemplate { get; set; }
         public string? SearchTemplate { get; set; }
+
+        /// <summary>
+        /// HTTP request headers sent with every download/probe for this source.
+        /// Use for sources that require a Referer, Accept, or UA to serve archives.
+        /// </summary>
+        public Dictionary<string, string> DefaultRequestHeaders { get; set; } = new Dictionary<string, string>();
     }
 
     /// <summary>Raw on-disk shape of FontSources.json.</summary>

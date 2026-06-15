@@ -36,6 +36,7 @@ namespace PublisherConverter.Core
         private readonly FontSourceConfiguration _config;
         private readonly IStructuredLogger _logger;
         private readonly Func<string> _scratchRootProvider;
+        private readonly LicenseApprovalCallback? _licenseApprovalCallback;
 
         private readonly object _stateLock = new object();
         private bool _automaticInstallEnabled;
@@ -50,7 +51,8 @@ namespace PublisherConverter.Core
             Func<IUserFontInstaller> installerFactory,
             FontSourceConfiguration config,
             IStructuredLogger? logger = null,
-            Func<string>? scratchRootProvider = null)
+            Func<string>? scratchRootProvider = null,
+            LicenseApprovalCallback? licenseApprovalCallback = null)
         {
             _microsoftLayer = microsoftLayer ?? throw new ArgumentNullException(nameof(microsoftLayer));
             _remoteResolvers = remoteResolvers ?? throw new ArgumentNullException(nameof(remoteResolvers));
@@ -60,6 +62,7 @@ namespace PublisherConverter.Core
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _logger = logger ?? NullStructuredLogger.Instance;
             _scratchRootProvider = scratchRootProvider ?? DefaultScratchRoot;
+            _licenseApprovalCallback = licenseApprovalCallback;
         }
 
         /// <summary>Structured per-font results from the most recent resolve call.</summary>
@@ -165,9 +168,22 @@ namespace PublisherConverter.Core
                         nowResolved.Add(fontName);
                         log.Add($"  ✓ {fontName} resolved via {result.Layer}/{result.SourceId} (confidence {result.MatchConfidence:F2}).");
                     }
+                    else if (result.ManualReviewRequired && result.DownloadedFilePath != null)
+                    {
+                        bool approved = await RequestLicenseApprovalAsync(fontName, result, log, cancellationToken).ConfigureAwait(false);
+                        if (approved && await InstallApprovedAsync(installer, fontName, result, log, cancellationToken).ConfigureAwait(false))
+                        {
+                            nowResolved.Add(fontName);
+                            log.Add($"  ✓ {fontName} resolved after user approved license (via {result.Layer}/{result.SourceId}).");
+                        }
+                        else if (!approved)
+                        {
+                            log.Add($"  ⚠ {fontName}: candidate found but license not approved — skipping.");
+                        }
+                    }
                     else if (result.ManualReviewRequired)
                     {
-                        log.Add($"  ⚠ {fontName}: candidate found via {result.Layer}/{result.SourceId} but license needs manual review — not installed.");
+                        log.Add($"  ⚠ {fontName}: candidate found via {result.Layer}/{result.SourceId} but license needs manual review — not installed (no staged file).");
                     }
                     else
                     {
@@ -237,6 +253,67 @@ namespace PublisherConverter.Core
                 Layer = ResolutionLayer.None,
                 FailureReason = "exhausted all layers",
             };
+        }
+
+        // Surfaces the staged candidate to the user. No callback wired → declined
+        // (the safe default for an unclear license).
+        private async Task<bool> RequestLicenseApprovalAsync(string fontName, FontAcquisitionResult result, IList<string> log, CancellationToken cancellationToken)
+        {
+            if (_licenseApprovalCallback == null) return false;
+
+            var request = new LicenseApprovalRequest
+            {
+                FontName = result.RequestedFontName,
+                SourceId = result.SourceId ?? result.Layer.ToString(),
+                SourceUrl = result.SourceUrl,
+                LicenseReason = result.FailureReason ?? "license requires manual review",
+                LicenseText = result.LicenseText,
+                StagedFilePath = result.DownloadedFilePath!,
+            };
+
+            try
+            {
+                return await _licenseApprovalCallback(request, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                log.Add($"  ! license approval callback threw for {fontName}: {ex.Message}");
+                return false;
+            }
+        }
+
+        // Installs an approved candidate from its staged scratch file and marks
+        // the cache so a later file treats the font as resolved.
+        private async Task<bool> InstallApprovedAsync(IUserFontInstaller installer, string fontName, FontAcquisitionResult result, IList<string> log, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var fs = File.OpenRead(result.DownloadedFilePath!);
+                bool installed = await installer.InstallFromStreamAsync(
+                    result.NormalizedFamily,
+                    Path.GetFileName(result.DownloadedFilePath!),
+                    fs, log, cancellationToken).ConfigureAwait(false);
+
+                if (installed)
+                {
+                    _cache.MarkInstalled(result.NormalizedFamily);
+                    _cache.MarkInstalled(fontName);
+                }
+                return installed;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                log.Add($"    ! post-approval install failed for {fontName}: {ex.Message}");
+                return false;
+            }
         }
 
         private static FontAcquisitionResult MicrosoftResult(string font, bool wasCacheHit)

@@ -67,7 +67,8 @@ namespace PublisherConverter.Core.FontSources
             double confidence,
             string styleToken,
             ResolverContext context,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? licenseText = null)
         {
             var integrity = FontIntegrityValidator.Validate(data);
             if (!integrity.IsValidTtf)
@@ -88,7 +89,7 @@ namespace PublisherConverter.Core.FontSources
                 Debug(context, $"{Layer}/{sourceId}: manual review required — {license.Reason}");
                 string staged = StageToScratch(context, request, styleToken, data);
                 return Result(request, AcquisitionStatus.ManualReviewRequired, sourceId, sourceUrl, confidence, styleToken, license.Status,
-                    downloadedPath: staged, manualReview: true, failure: license.Reason);
+                    downloadedPath: staged, manualReview: true, failure: license.Reason, licenseText: licenseText);
             }
 
             // Allowed or NotApplicable → stage + install.
@@ -130,7 +131,8 @@ namespace PublisherConverter.Core.FontSources
         protected FontAcquisitionResult Result(
             FontRequest request, AcquisitionStatus status, string sourceId, string? sourceUrl,
             double confidence, string styleToken, LicenseStatus license,
-            string? downloadedPath = null, string? installedPath = null, string? failure = null, bool manualReview = false)
+            string? downloadedPath = null, string? installedPath = null, string? failure = null, bool manualReview = false,
+            string? licenseText = null)
             => new FontAcquisitionResult
             {
                 RequestedFontName = request.RequestedName,
@@ -146,6 +148,7 @@ namespace PublisherConverter.Core.FontSources
                 MatchConfidence = confidence,
                 FailureReason = failure,
                 ManualReviewRequired = manualReview,
+                LicenseText = licenseText,
             };
 
         protected void Debug(ResolverContext context, string message)
