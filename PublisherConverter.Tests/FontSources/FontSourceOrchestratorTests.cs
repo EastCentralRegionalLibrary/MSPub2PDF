@@ -176,6 +176,26 @@ namespace PublisherConverter.Tests.FontSources
             Assert.Contains("Lemon Cookie Bold", outcome.Resolved);
             Assert.DoesNotContain("Lemon Cookie Bold", outcome.StillMissing);
             Assert.Single(b.Installer.InstalledFromStream);
+            // LastResults must agree with the Resolved list (not stuck on ManualReview).
+            var record = b.Orchestrator.LastResults.Single(r => r.RequestedFontName == "Lemon Cookie Bold");
+            Assert.Equal(AcquisitionStatus.Installed, record.Status);
+            Assert.False(record.ManualReviewRequired);
+        }
+
+        [Fact]
+        public async Task License_Approved_But_Install_Fails_FontStaysMissing()
+        {
+            string staged = StageFont("Lemon Cookie Bold");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community, staged, "free for personal use only"),
+                licenseApproval: Approval(_ => true));
+            b.Installer.StreamShouldSucceed = (_, _) => false; // install fails after approval
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Lemon Cookie Bold" }, CancellationToken.None);
+
+            Assert.Contains("Lemon Cookie Bold", outcome.StillMissing);
+            Assert.Contains(outcome.Log, l => l.Contains("install failed"));
         }
 
         [Fact]

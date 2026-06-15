@@ -159,6 +159,7 @@ namespace PublisherConverter.Core
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var result = await ResolveOneAsync(fontName, context, cancellationToken).ConfigureAwait(false);
+                    int resultIndex = results.Count;
                     results.Add(result);
 
                     if (result.IsResolved)
@@ -171,14 +172,20 @@ namespace PublisherConverter.Core
                     else if (result.ManualReviewRequired && result.DownloadedFilePath != null)
                     {
                         bool approved = await RequestLicenseApprovalAsync(fontName, result, log, cancellationToken).ConfigureAwait(false);
-                        if (approved && await InstallApprovedAsync(installer, fontName, result, log, cancellationToken).ConfigureAwait(false))
-                        {
-                            nowResolved.Add(fontName);
-                            log.Add($"  ✓ {fontName} resolved after user approved license (via {result.Layer}/{result.SourceId}).");
-                        }
-                        else if (!approved)
+                        if (!approved)
                         {
                             log.Add($"  ⚠ {fontName}: candidate found but license not approved — skipping.");
+                        }
+                        else if (await InstallApprovedAsync(installer, fontName, result, log, cancellationToken).ConfigureAwait(false))
+                        {
+                            nowResolved.Add(fontName);
+                            // Reflect the post-approval install in the structured results.
+                            results[resultIndex] = AsInstalled(result);
+                            log.Add($"  ✓ {fontName} resolved after user approved license (via {result.Layer}/{result.SourceId}).");
+                        }
+                        else
+                        {
+                            log.Add($"  ⚠ {fontName}: license approved but install failed — not resolved.");
                         }
                     }
                     else if (result.ManualReviewRequired)
@@ -315,6 +322,26 @@ namespace PublisherConverter.Core
                 return false;
             }
         }
+
+        // A post-approval install turns a ManualReviewRequired result into an
+        // Installed one so LastResults agrees with the returned Resolved list.
+        private static FontAcquisitionResult AsInstalled(FontAcquisitionResult r)
+            => new FontAcquisitionResult
+            {
+                RequestedFontName = r.RequestedFontName,
+                NormalizedFamily = r.NormalizedFamily,
+                RequestedStyle = r.RequestedStyle,
+                Status = AcquisitionStatus.Installed,
+                Layer = r.Layer,
+                SourceId = r.SourceId,
+                SourceUrl = r.SourceUrl,
+                DownloadedFilePath = r.DownloadedFilePath,
+                InstalledFilePath = r.DownloadedFilePath,
+                License = r.License,
+                MatchConfidence = r.MatchConfidence,
+                LicenseText = r.LicenseText,
+                ManualReviewRequired = false,
+            };
 
         private static FontAcquisitionResult MicrosoftResult(string font, bool wasCacheHit)
             => new FontAcquisitionResult
