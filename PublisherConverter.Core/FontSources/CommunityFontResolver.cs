@@ -21,6 +21,12 @@ namespace PublisherConverter.Core.FontSources
     public sealed class CommunityFontResolver : FontSourceResolverBase
     {
         private const long MaxArchiveBytes = 100 * 1024 * 1024;
+
+        // Smallest possible ZIP is a 22-byte End-Of-Central-Directory record.
+        // Anything shorter is an empty/error response (DaFont answers a missing
+        // font with HTTP 200 + a zero-length body), never a real archive.
+        private const int MinArchiveBytes = 22;
+
         private const double DefaultMatchThreshold = 0.6;
 
         private static readonly Regex SlugRegex = new Regex(@"[?&]f=([a-zA-Z0-9_]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -82,7 +88,8 @@ namespace PublisherConverter.Core.FontSources
                 if (probe.Exists)
                 {
                     byte[]? bytes = await _http.DownloadBytesAsync(url, headers, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
-                    if (bytes != null) return (bytes, url, 0.9);
+                    if (bytes != null && bytes.Length >= MinArchiveBytes) return (bytes, url, 0.9);
+                    if (bytes != null) Debug(context, $"community: empty/short response ({bytes.Length} bytes) for '{slug}' — treating as miss");
                 }
                 Debug(context, $"community: direct slug '{slug}' missed");
             }
@@ -106,7 +113,8 @@ namespace PublisherConverter.Core.FontSources
                         {
                             string url = UrlTemplate.Expand(source.SlugTemplate!, new Dictionary<string, string> { ["slug"] = chosen.Value.slug, ["query"] = chosen.Value.slug });
                             byte[]? bytes = await _http.DownloadBytesAsync(url, headers, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
-                            if (bytes != null) return (bytes, url, chosen.Value.confidence);
+                            if (bytes != null && bytes.Length >= MinArchiveBytes) return (bytes, url, chosen.Value.confidence);
+                            if (bytes != null) Debug(context, $"community: empty/short response ({bytes.Length} bytes) for '{chosen.Value.slug}' — treating as miss");
                         }
                     }
                 }

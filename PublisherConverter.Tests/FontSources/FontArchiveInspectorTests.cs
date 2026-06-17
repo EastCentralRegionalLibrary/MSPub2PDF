@@ -65,6 +65,31 @@ namespace PublisherConverter.Tests.FontSources
         }
 
         [Fact]
+        public async Task Empty_stream_throws_clear_not_a_zip_error()
+        {
+            using var ms = new MemoryStream(System.Array.Empty<byte>());
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None));
+
+            Assert.Contains("not a valid ZIP", ex.Message);
+            Assert.DoesNotContain("Central Directory", ex.Message);
+        }
+
+        [Fact]
+        public async Task Sub_22_byte_payload_throws_clear_error()
+        {
+            // Starts with the ZIP local-file-header magic but is far too short.
+            byte[] tooShort = { 0x50, 0x4B, 0x03, 0x04, 1, 2, 3, 4, 5, 6 };
+
+            using var ms = new MemoryStream(tooShort);
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None));
+
+            Assert.Contains("not a valid ZIP", ex.Message);
+            Assert.DoesNotContain("Central Directory", ex.Message);
+        }
+
+        [Fact]
         public async Task Zip_magic_check_passes_for_valid_zip()
         {
             byte[] zip = ZipBuilder.Build(new[]

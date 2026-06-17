@@ -51,8 +51,20 @@ namespace PublisherConverter.Core.FontSources
             // Validate ZIP magic before handing to ZipArchive, to produce a clear error
             // rather than a misleading "Central Directory corrupt" exception when the
             // server returned an HTML error/challenge page instead of the archive.
-            if (archiveStream.CanSeek && archiveStream.Length >= 4)
+            if (archiveStream.CanSeek)
             {
+                long len = archiveStream.Length;
+                // The smallest valid ZIP (empty, End-Of-Central-Directory only) is
+                // 22 bytes. Anything shorter — including the 0-byte body a server
+                // returns for a missing resource — is rejected with a clear error
+                // rather than slipping into ZipArchive's "Central Directory" message.
+                if (len < 22)
+                {
+                    throw new InvalidDataException(
+                        $"Downloaded payload is not a valid ZIP ({len} bytes; minimum is 22). " +
+                        "The server likely returned an empty or error response.");
+                }
+
                 archiveStream.Position = 0;
                 var magic = new byte[4];
                 int read = archiveStream.Read(magic, 0, 4);

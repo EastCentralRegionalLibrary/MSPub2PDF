@@ -199,6 +199,24 @@ namespace PublisherConverter.Tests.FontSources
         }
 
         [Fact]
+        public async Task License_ManualReview_NullCallback_DeclinesByDefault()
+        {
+            // Pins the safe default: with no approval callback wired (the state a
+            // GUI-less or misconfigured host is in) a manual-review font is never
+            // silently auto-installed.
+            string staged = StageFont("Lemon Cookie Bold");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community, staged, "free for personal use only"),
+                licenseApproval: null);
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Lemon Cookie Bold" }, CancellationToken.None);
+
+            Assert.Contains("Lemon Cookie Bold", outcome.StillMissing);
+            Assert.Empty(b.Installer.InstalledFromStream);
+        }
+
+        [Fact]
         public async Task License_ManualReview_CallbackDeclines_FontNotInstalled()
         {
             string staged = StageFont("Lemon Cookie Bold");

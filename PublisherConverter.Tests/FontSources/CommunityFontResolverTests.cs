@@ -98,6 +98,22 @@ namespace PublisherConverter.Tests.FontSources
             Assert.DoesNotContain(h.Log, l => l.Contains("Central Directory"));
         }
 
+        [Fact]
+        public async Task Empty_download_is_treated_as_miss_not_error()
+        {
+            // DaFont answers a missing font with HTTP 200 + a zero-length body:
+            // the probe sees success and the download returns an empty (non-null) array.
+            var (resolver, http, norm) = Build();
+            http.SeedFile("https://dl.dafont.com/dl/?f=lucidasans", System.Array.Empty<byte>());
+
+            using var h = new ResolverHarness();
+            var result = await resolver.TryResolveAsync(norm.Parse("Lucida Sans"), h.Context(), CancellationToken.None);
+
+            Assert.Equal(AcquisitionStatus.Missing, result.Status);
+            Assert.DoesNotContain(h.Log, l => l.Contains("Central Directory"));
+            Assert.DoesNotContain(h.Log, l => l.Contains("archive inspection failed"));
+        }
+
         // ---- Issue 4: search disambiguation ----
 
         // Request whose slug (lemoncookiefont) is NOT one of the candidates, so Step A
