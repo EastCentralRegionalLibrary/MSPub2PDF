@@ -37,7 +37,7 @@ namespace PublisherConverter.Tests.FontSources
         }
 
         [Fact]
-        public async Task Returns_no_fonts_when_archive_has_none()
+        public async Task Valid_zip_with_no_fonts_returns_empty_result()
         {
             byte[] zip = ZipBuilder.Build(new[]
             {
@@ -49,6 +49,58 @@ namespace PublisherConverter.Tests.FontSources
             var result = await new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None);
 
             Assert.Empty(result.Fonts);
+        }
+
+        [Fact]
+        public async Task Non_zip_bytes_throw_InvalidDataException_with_clear_message()
+        {
+            byte[] html = System.Text.Encoding.UTF8.GetBytes("<html><head><title>Error</title></head><body>403</body></html>");
+
+            using var ms = new MemoryStream(html);
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None));
+
+            Assert.Contains("not a ZIP file", ex.Message);
+            Assert.DoesNotContain("Central Directory", ex.Message);
+        }
+
+        [Fact]
+        public async Task Empty_stream_throws_clear_not_a_zip_error()
+        {
+            using var ms = new MemoryStream(System.Array.Empty<byte>());
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None));
+
+            Assert.Contains("not a valid ZIP", ex.Message);
+            Assert.DoesNotContain("Central Directory", ex.Message);
+        }
+
+        [Fact]
+        public async Task Sub_22_byte_payload_throws_clear_error()
+        {
+            // Starts with the ZIP local-file-header magic but is far too short.
+            byte[] tooShort = { 0x50, 0x4B, 0x03, 0x04, 1, 2, 3, 4, 5, 6 };
+
+            using var ms = new MemoryStream(tooShort);
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None));
+
+            Assert.Contains("not a valid ZIP", ex.Message);
+            Assert.DoesNotContain("Central Directory", ex.Message);
+        }
+
+        [Fact]
+        public async Task Zip_magic_check_passes_for_valid_zip()
+        {
+            byte[] zip = ZipBuilder.Build(new[]
+            {
+                ("Font-Regular.ttf", TtfTestBuilder.BuildValidTtf("Font")),
+            });
+
+            using var ms = new MemoryStream(zip);
+            var result = await new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None);
+
+            Assert.Single(result.Fonts);
         }
     }
 }

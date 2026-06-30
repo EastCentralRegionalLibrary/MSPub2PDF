@@ -21,6 +21,12 @@ namespace PublisherConverter.Core.FontSources
     public sealed class CommunityFontResolver : FontSourceResolverBase
     {
         private const long MaxArchiveBytes = 100 * 1024 * 1024;
+
+        // Smallest possible ZIP is a 22-byte End-Of-Central-Directory record.
+        // Anything shorter is an empty/error response (DaFont answers a missing
+        // font with HTTP 200 + a zero-length body), never a real archive.
+        private const int MinArchiveBytes = 22;
+
         private const double DefaultMatchThreshold = 0.6;
 
         private static readonly Regex SlugRegex = new Regex(@"[?&]f=([a-zA-Z0-9_]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -28,15 +34,18 @@ namespace PublisherConverter.Core.FontSources
         private readonly FontSourceConfiguration _config;
         private readonly IFontHttpClient _http;
         private readonly FontArchiveInspector _archiveInspector;
+        private readonly DisambiguationCallback? _disambiguationCallback;
 
         public CommunityFontResolver(
             FontSourceConfiguration config, IFontHttpClient http,
-            FontArchiveInspector archiveInspector, FontLicenseEvaluator license, IStructuredLogger? logger = null)
+            FontArchiveInspector archiveInspector, FontLicenseEvaluator license, IStructuredLogger? logger = null,
+            DisambiguationCallback? disambiguationCallback = null)
             : base(license, logger)
         {
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _http = http ?? throw new ArgumentNullException(nameof(http));
             _archiveInspector = archiveInspector ?? throw new ArgumentNullException(nameof(archiveInspector));
+            _disambiguationCallback = disambiguationCallback;
         }
 
         public override ResolutionLayer Layer => ResolutionLayer.Community;
@@ -69,43 +78,89 @@ namespace PublisherConverter.Core.FontSources
             TimeSpan probeTimeout, TimeSpan downloadTimeout, CancellationToken cancellationToken)
         {
             string slug = UrlTemplate.Slug(request.NormalizedFamily);
+            var headers = Headers(source);
 
             // Step A — direct slug guess.
             if (source.ProbeStrategy != ProbeStrategy.SearchOnly && !string.IsNullOrWhiteSpace(source.SlugTemplate))
             {
                 string url = UrlTemplate.Expand(source.SlugTemplate!, new Dictionary<string, string> { ["slug"] = slug, ["query"] = slug });
-                var probe = await _http.ProbeAsync(url, null, probeTimeout, cancellationToken).ConfigureAwait(false);
+                var probe = await _http.ProbeAsync(url, headers, probeTimeout, cancellationToken).ConfigureAwait(false);
                 if (probe.Exists)
                 {
-                    byte[]? bytes = await _http.DownloadBytesAsync(url, null, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
-                    if (bytes != null) return (bytes, url, 0.9);
+                    byte[]? bytes = await _http.DownloadBytesAsync(url, headers, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
+                    if (bytes != null && bytes.Length >= MinArchiveBytes) return (bytes, url, 0.9);
+                    if (bytes != null) Debug(context, $"community: empty/short response ({bytes.Length} bytes) for '{slug}' — treating as miss");
                 }
                 Debug(context, $"community: direct slug '{slug}' missed");
             }
 
             // Step B — search page fallback.
-            if (source.ProbeStrategy != ProbeStrategy.SlugOnly && !string.IsNullOrWhiteSpace(source.SearchTemplate))
+            if (source.ProbeStrategy != ProbeStrategy.SlugOnly && !string.IsNullOrWhiteSpace(source.SearchTemplate) && !string.IsNullOrWhiteSpace(source.SlugTemplate))
             {
                 string searchUrl = UrlTemplate.Expand(source.SearchTemplate!, new Dictionary<string, string> { ["query"] = Uri.EscapeDataString(request.NormalizedFamily), ["slug"] = slug });
-                string? html = await _http.GetStringAsync(searchUrl, null, downloadTimeout, cancellationToken).ConfigureAwait(false);
+                string? html = await _http.GetStringAsync(searchUrl, headers, downloadTimeout, cancellationToken).ConfigureAwait(false);
                 if (html != null)
                 {
-                    var (bestSlug, confidence) = BestSearchMatch(html, slug);
-                    if (bestSlug != null && confidence >= DefaultMatchThreshold && !string.IsNullOrWhiteSpace(source.SlugTemplate))
+                    var matches = SearchMatches(html, slug);
+                    if (matches.Count == 0)
                     {
-                        string url = UrlTemplate.Expand(source.SlugTemplate!, new Dictionary<string, string> { ["slug"] = bestSlug, ["query"] = bestSlug });
-                        byte[]? bytes = await _http.DownloadBytesAsync(url, null, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
-                        if (bytes != null) return (bytes, url, confidence);
+                        Debug(context, $"community: no search match above threshold for '{slug}'");
                     }
                     else
                     {
-                        Debug(context, $"community: search match below threshold for '{slug}' (best={bestSlug}, conf={confidence:F2})");
+                        var chosen = await ChooseSearchMatchAsync(source, request, matches, context, cancellationToken).ConfigureAwait(false);
+                        if (chosen != null)
+                        {
+                            string url = UrlTemplate.Expand(source.SlugTemplate!, new Dictionary<string, string> { ["slug"] = chosen.Value.slug, ["query"] = chosen.Value.slug });
+                            byte[]? bytes = await _http.DownloadBytesAsync(url, headers, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
+                            if (bytes != null && bytes.Length >= MinArchiveBytes) return (bytes, url, chosen.Value.confidence);
+                            if (bytes != null) Debug(context, $"community: empty/short response ({bytes.Length} bytes) for '{chosen.Value.slug}' — treating as miss");
+                        }
                     }
                 }
             }
 
             return (null, null, 0);
         }
+
+        // Picks among above-threshold search matches: a single match (or no callback)
+        // takes the highest confidence; otherwise the user disambiguates. Index -1
+        // (or an out-of-range / throwing callback) cancels this source.
+        private async Task<(string slug, double confidence)?> ChooseSearchMatchAsync(
+            FontSourceDefinition source, FontRequest request,
+            List<(string slug, double confidence)> matches, ResolverContext context, CancellationToken cancellationToken)
+        {
+            if (matches.Count == 1 || _disambiguationCallback == null) return matches[0];
+
+            var candidates = matches
+                .Select(m => new DisambiguationCandidate { Slug = m.slug, SourceId = source.Id, Confidence = m.confidence })
+                .ToList();
+
+            int index;
+            try
+            {
+                index = await _disambiguationCallback(request.RequestedName, candidates, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Debug(context, $"community: disambiguation callback threw — {ex.Message}; skipping source");
+                return null;
+            }
+
+            if (index < 0 || index >= matches.Count)
+            {
+                Debug(context, $"community: user cancelled disambiguation for '{request.RequestedName}'");
+                return null;
+            }
+            return matches[index];
+        }
+
+        private static IDictionary<string, string>? Headers(FontSourceDefinition source)
+            => source.DefaultRequestHeaders.Count > 0 ? source.DefaultRequestHeaders : null;
 
         private async Task<FontAcquisitionResult> InstallFromArchiveAsync(
             FontSourceDefinition source, FontRequest request, ResolverContext context,
@@ -136,7 +191,7 @@ namespace PublisherConverter.Core.FontSources
             FontAcquisitionResult? primary = null;
             foreach (var font in chosen)
             {
-                var outcome = await FinalizeTtfAsync(request, source.Id, sourceUrl, font.Data, license, confidence, "Regular", context, cancellationToken).ConfigureAwait(false);
+                var outcome = await FinalizeTtfAsync(request, source.Id, sourceUrl, font.Data, license, confidence, "Regular", context, cancellationToken, inspection.LicenseText).ConfigureAwait(false);
                 // Carry the first non-missing outcome (installed / manual-review / rejected).
                 if (primary == null && outcome.Status != AcquisitionStatus.Missing) primary = outcome;
                 if (outcome.IsResolved) { primary = outcome; break; }
@@ -156,19 +211,23 @@ namespace PublisherConverter.Core.FontSources
             return inspection.Fonts.Count == 1 ? new List<ArchivedFont>(inspection.Fonts) : new List<ArchivedFont>();
         }
 
-        internal static (string? slug, double confidence) BestSearchMatch(string html, string targetSlug)
+        // Returns every distinct candidate slug scoring at/above the threshold,
+        // ordered by descending confidence — so a single hit proceeds directly and
+        // multiple hits can be disambiguated by the user instead of silently
+        // taking the top one.
+        internal static List<(string slug, double confidence)> SearchMatches(string html, string targetSlug, double threshold = DefaultMatchThreshold)
         {
-            string? best = null;
-            double bestScore = 0;
+            var scored = new List<(string slug, double confidence)>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (Match m in SlugRegex.Matches(html))
             {
                 string candidate = m.Groups[1].Value.ToLowerInvariant();
                 if (!seen.Add(candidate)) continue;
                 double score = SlugSimilarity(targetSlug, candidate);
-                if (score > bestScore) { bestScore = score; best = candidate; }
+                if (score >= threshold) scored.Add((candidate, score));
             }
-            return (best, bestScore);
+            scored.Sort((a, b) => b.confidence.CompareTo(a.confidence));
+            return scored;
         }
 
         internal static double SlugSimilarity(string a, string b)

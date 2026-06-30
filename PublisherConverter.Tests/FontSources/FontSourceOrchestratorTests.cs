@@ -29,16 +29,19 @@ namespace PublisherConverter.Tests.FontSources
             public required ScriptedSourceResolver Vendor { get; init; }
             public required ScriptedSourceResolver Community { get; init; }
             public required FontAvailabilityCache Cache { get; init; }
+            public required FakeUserFontInstaller Installer { get; init; }
         }
 
         private Built BuildOrchestrator(
             Func<FontRequest, FontAcquisitionResult>? google = null,
             Func<FontRequest, FontAcquisitionResult>? vendor = null,
-            Func<FontRequest, FontAcquisitionResult>? community = null)
+            Func<FontRequest, FontAcquisitionResult>? community = null,
+            LicenseApprovalCallback? licenseApproval = null)
         {
             var inner = new FakeInnerResolver();
             var cache = new FontAvailabilityCache(new SetInstalledFontProvider());
             var config = FontSourceConfiguration.LoadFromJson("{}");
+            var installer = new FakeUserFontInstaller();
 
             var g = new ScriptedSourceResolver(ResolutionLayer.GoogleFonts, google ?? (r => ScriptedSourceResolver.Miss(r, ResolutionLayer.GoogleFonts)));
             var v = new ScriptedSourceResolver(ResolutionLayer.VendorRepo, vendor ?? (r => ScriptedSourceResolver.Miss(r, ResolutionLayer.VendorRepo)));
@@ -47,11 +50,24 @@ namespace PublisherConverter.Tests.FontSources
             var orch = new FontSourceOrchestrator(
                 inner, new IFontSourceResolver[] { g, v, c },
                 new FontFamilyNormalizer(), cache,
-                () => new FakeUserFontInstaller(), config, null,
-                scratchRootProvider: () => _scratchRoot);
+                () => installer, config, null,
+                scratchRootProvider: () => _scratchRoot,
+                licenseApprovalCallback: licenseApproval);
 
-            return new Built { Orchestrator = orch, Inner = inner, Google = g, Vendor = v, Community = c, Cache = cache };
+            return new Built { Orchestrator = orch, Inner = inner, Google = g, Vendor = v, Community = c, Cache = cache, Installer = installer };
         }
+
+        // Stages a real .ttf the orchestrator can install from on approval.
+        private string StageFont(string family)
+        {
+            Directory.CreateDirectory(_scratchRoot);
+            string path = Path.Combine(_scratchRoot, family.Replace(" ", "") + ".ttf");
+            File.WriteAllBytes(path, TtfTestBuilder.BuildValidTtf(family));
+            return path;
+        }
+
+        private static LicenseApprovalCallback Approval(Func<LicenseApprovalRequest, bool> decide)
+            => (req, _) => Task.FromResult(decide(req));
 
         private static FontProvisioningPolicy Policy(bool auto) => new FontProvisioningPolicy { AutomaticInstallEnabled = auto, AllowElevatedInstall = false };
 
@@ -142,6 +158,111 @@ namespace PublisherConverter.Tests.FontSources
             Assert.Empty(b.Google.Seen);            // skipped
             Assert.Single(b.Vendor.Seen);           // vendor handled it
             Assert.Contains("Roboto", outcome.Resolved);
+        }
+
+        // ---- Issue 1: license approval ----
+
+        [Fact]
+        public async Task License_ManualReview_CallbackApproves_FontInstalled()
+        {
+            string staged = StageFont("Lemon Cookie Bold");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community, staged, "free for personal use only"),
+                licenseApproval: Approval(_ => true));
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Lemon Cookie Bold" }, CancellationToken.None);
+
+            Assert.Contains("Lemon Cookie Bold", outcome.Resolved);
+            Assert.DoesNotContain("Lemon Cookie Bold", outcome.StillMissing);
+            Assert.Single(b.Installer.InstalledFromStream);
+            // LastResults must agree with the Resolved list (not stuck on ManualReview).
+            var record = b.Orchestrator.LastResults.Single(r => r.RequestedFontName == "Lemon Cookie Bold");
+            Assert.Equal(AcquisitionStatus.Installed, record.Status);
+            Assert.False(record.ManualReviewRequired);
+        }
+
+        [Fact]
+        public async Task License_Approved_But_Install_Fails_FontStaysMissing()
+        {
+            string staged = StageFont("Lemon Cookie Bold");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community, staged, "free for personal use only"),
+                licenseApproval: Approval(_ => true));
+            b.Installer.StreamShouldSucceed = (_, _) => false; // install fails after approval
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Lemon Cookie Bold" }, CancellationToken.None);
+
+            Assert.Contains("Lemon Cookie Bold", outcome.StillMissing);
+            Assert.Contains(outcome.Log, l => l.Contains("install failed"));
+        }
+
+        [Fact]
+        public async Task License_ManualReview_NullCallback_DeclinesByDefault()
+        {
+            // Pins the safe default: with no approval callback wired (the state a
+            // GUI-less or misconfigured host is in) a manual-review font is never
+            // silently auto-installed.
+            string staged = StageFont("Lemon Cookie Bold");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community, staged, "free for personal use only"),
+                licenseApproval: null);
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Lemon Cookie Bold" }, CancellationToken.None);
+
+            Assert.Contains("Lemon Cookie Bold", outcome.StillMissing);
+            Assert.Empty(b.Installer.InstalledFromStream);
+        }
+
+        [Fact]
+        public async Task License_ManualReview_CallbackDeclines_FontNotInstalled()
+        {
+            string staged = StageFont("Lemon Cookie Bold");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community, staged, "free for personal use only"),
+                licenseApproval: Approval(_ => false));
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Lemon Cookie Bold" }, CancellationToken.None);
+
+            Assert.Contains("Lemon Cookie Bold", outcome.StillMissing);
+            Assert.Empty(b.Installer.InstalledFromStream);
+        }
+
+        [Fact]
+        public async Task License_Absent_NoCallbackNeeded_AutoInstall()
+        {
+            int callbackInvocations = 0;
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.Installed(r, ResolutionLayer.Community),
+                licenseApproval: Approval(_ => { callbackInvocations++; return true; }));
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Roboto" }, CancellationToken.None);
+
+            Assert.Contains("Roboto", outcome.Resolved);
+            Assert.Equal(0, callbackInvocations); // Allowed → installs without prompting
+        }
+
+        [Fact]
+        public async Task Multiple_Fonts_Each_Requires_Approval_CallbackCalledPerFont()
+        {
+            string stagedA = StageFont("Font A");
+            string stagedB = StageFont("Font B");
+            var b = BuildOrchestrator(
+                community: r => ScriptedSourceResolver.ManualStaged(r, ResolutionLayer.Community,
+                    r.NormalizedFamily == "Font A" ? stagedA : stagedB, "free for personal use only"),
+                // Approve "Font A", decline "Font B".
+                licenseApproval: Approval(req => req.FontName == "Font A"));
+            await b.Orchestrator.BeginCycleAsync(Policy(true), CancellationToken.None);
+
+            var outcome = await b.Orchestrator.ResolveMissingFontsAsync(new[] { "Font A", "Font B" }, CancellationToken.None);
+
+            Assert.Contains("Font A", outcome.Resolved);
+            Assert.Contains("Font B", outcome.StillMissing);
+            Assert.Single(b.Installer.InstalledFromStream); // only the approved one
         }
     }
 }

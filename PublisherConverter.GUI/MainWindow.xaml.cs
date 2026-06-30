@@ -133,7 +133,7 @@ namespace PublisherConverter.GUI
         /// malformed the failure is surfaced and the app falls back to
         /// Microsoft-only acquisition so a config error never blocks startup.
         /// </summary>
-        private static IFontResolver BuildFontResolver(
+        private IFontResolver BuildFontResolver(
             IFontResolver microsoftLayer,
             FontAvailabilityCache cache,
             HttpFontDownloader downloader,
@@ -160,18 +160,36 @@ namespace PublisherConverter.GUI
             var archive = new FontArchiveInspector();
             var normalizer = new FontFamilyNormalizer(config);
 
+            // The resolver runs on a worker context; both prompts must marshal to
+            // the UI thread before showing a modal dialog.
+            LicenseApprovalCallback licenseApproval = (req, ct) =>
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    var dlg = new LicenseApprovalWindow(req) { Owner = this };
+                    return dlg.ShowDialog() == true; // true = Install
+                }).Task;
+
+            DisambiguationCallback disambiguation = (fontName, candidates, ct) =>
+                Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    var dlg = new FontDisambiguationWindow(fontName, candidates) { Owner = this };
+                    return dlg.ShowDialog() == true ? dlg.SelectedIndex : -1; // -1 = cancel
+                }).Task;
+
             var resolvers = new List<IFontSourceResolver>
             {
                 new LocalFontResolver(cache, config, logger),
                 new GoogleFontsResolver(config, http, license, logger),
                 new VendorRepoResolver(config, http, archive, license, logger),
-                new CommunityFontResolver(config, http, archive, license, logger),
+                new CommunityFontResolver(config, http, archive, license, logger, disambiguation),
             };
 
             // Non-Microsoft .ttf payloads install per-user (HKCU) — no elevation.
             Func<IUserFontInstaller> userInstaller = () => new WindowsUserFontInstaller(downloader);
 
-            return new FontSourceOrchestrator(microsoftLayer, resolvers, normalizer, cache, userInstaller, config, logger);
+            return new FontSourceOrchestrator(
+                microsoftLayer, resolvers, normalizer, cache, userInstaller, config, logger,
+                licenseApprovalCallback: licenseApproval);
         }
 
         /// <summary>

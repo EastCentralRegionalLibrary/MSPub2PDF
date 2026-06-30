@@ -90,6 +90,9 @@ namespace PublisherConverter.Core.FontSources
         public string? FailureReason { get; init; }
         public bool ManualReviewRequired { get; init; }
 
+        /// <summary>Raw text of the license file extracted from the archive, if present.</summary>
+        public string? LicenseText { get; init; }
+
         /// <summary>True when the font is present after this attempt (installed or already local).</summary>
         public bool IsResolved => Status == AcquisitionStatus.Installed || Status == AcquisitionStatus.Acquired;
 

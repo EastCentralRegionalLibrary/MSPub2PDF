@@ -97,6 +97,18 @@ namespace PublisherConverter.Tests.FontSources
             Status = AcquisitionStatus.ManualReviewRequired, Layer = layer, SourceId = layer.ToString(),
             License = LicenseStatus.ManualReviewRequired, ManualReviewRequired = true,
         };
+
+        // Manual-review result carrying a real staged file the orchestrator can
+        // install from once the user approves.
+        public static FontAcquisitionResult ManualStaged(FontRequest r, ResolutionLayer layer, string stagedPath, string? licenseText = null, string sourceId = "dafont")
+            => new FontAcquisitionResult
+            {
+                RequestedFontName = r.RequestedName, NormalizedFamily = r.NormalizedFamily,
+                Status = AcquisitionStatus.ManualReviewRequired, Layer = layer, SourceId = sourceId,
+                License = LicenseStatus.ManualReviewRequired, ManualReviewRequired = true,
+                DownloadedFilePath = stagedPath, LicenseText = licenseText,
+                FailureReason = "matched manual-review keyword 'free for personal use'",
+            };
     }
 
     /// <summary>

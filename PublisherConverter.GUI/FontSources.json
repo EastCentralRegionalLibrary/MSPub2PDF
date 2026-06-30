@@ -137,6 +137,10 @@
       "slugTemplate": "https://dl.dafont.com/dl/?f={slug}",
       "searchTemplate": "https://www.dafont.com/search.php?q={query}",
       "probeStrategy": "slugThenSearch",
+      "defaultRequestHeaders": {
+        "Referer": "https://www.dafont.com/",
+        "Accept": "application/zip,application/octet-stream,*/*"
+      },
       "archive": {
         "extractExtensions": [ ".ttf" ],
         "licenseFileNames": [ "readme.txt", "license.txt", "info.txt", "read me.txt" ]

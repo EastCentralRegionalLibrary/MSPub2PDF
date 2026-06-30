@@ -48,6 +48,36 @@ namespace PublisherConverter.Core.FontSources
             var licenseBuilder = new StringBuilder();
             var foundLicenseFiles = new List<string>();
 
+            // Validate ZIP magic before handing to ZipArchive, to produce a clear error
+            // rather than a misleading "Central Directory corrupt" exception when the
+            // server returned an HTML error/challenge page instead of the archive.
+            if (archiveStream.CanSeek)
+            {
+                long len = archiveStream.Length;
+                // The smallest valid ZIP (empty, End-Of-Central-Directory only) is
+                // 22 bytes. Anything shorter — including the 0-byte body a server
+                // returns for a missing resource — is rejected with a clear error
+                // rather than slipping into ZipArchive's "Central Directory" message.
+                if (len < 22)
+                {
+                    throw new InvalidDataException(
+                        $"Downloaded payload is not a valid ZIP ({len} bytes; minimum is 22). " +
+                        "The server likely returned an empty or error response.");
+                }
+
+                archiveStream.Position = 0;
+                var magic = new byte[4];
+                int read = archiveStream.Read(magic, 0, 4);
+                if (read == 4
+                    && !(magic[0] == 0x50 && magic[1] == 0x4B && magic[2] == 0x03 && magic[3] == 0x04))
+                {
+                    throw new InvalidDataException(
+                        $"Downloaded payload is not a ZIP file (first bytes: {magic[0]:X2} {magic[1]:X2} {magic[2]:X2} {magic[3]:X2}). " +
+                        "The server may require specific HTTP headers or a session cookie.");
+                }
+                archiveStream.Position = 0;
+            }
+
             using var zip = new ZipArchive(archiveStream, ZipArchiveMode.Read, leaveOpen: true);
             foreach (var entry in zip.Entries)
             {
