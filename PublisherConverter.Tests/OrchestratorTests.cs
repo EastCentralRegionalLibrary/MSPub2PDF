@@ -41,6 +41,21 @@ namespace PublisherConverter.Tests
         }
 
         [Fact]
+        public void Dispose_DisposesRenderer()
+        {
+            var engine = CreateEngine();
+
+            engine.Dispose();
+
+            Assert.True(_renderer.ShutdownCalled);
+            Assert.Equal(1, _renderer.ShutdownCount);
+
+            // Idempotent: a second Dispose does not shut the renderer down again.
+            engine.Dispose();
+            Assert.Equal(1, _renderer.ShutdownCount);
+        }
+
+        [Fact]
         public async Task Orchestrator_ShouldHandleManifestWritabilityFailure()
         {
             // Arrange

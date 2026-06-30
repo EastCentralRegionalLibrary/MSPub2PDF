@@ -31,6 +31,13 @@ namespace PublisherConverter.Core
         private CancellationTokenSource? _watchdogCts;
         private Thread? _watchdogThread;
 
+        // Worker-tier kill-on-close job holding the DCOM-activated mspub.exe.
+        // mspub is not a child of this worker process (it is activated under
+        // DcomLaunch), so killing the worker's process tree never reaches it.
+        // Assigning its PID to a kill-on-close job means a worker death — clean
+        // or otherwise — reaps mspub via the OS. IntPtr.Zero when unavailable.
+        private IntPtr _mspubJob = IntPtr.Zero;
+
         public event EventHandler? EngineCrashed;
 
         public void Initialize()
@@ -48,6 +55,29 @@ namespace PublisherConverter.Core
             if (_publisherProcess != null)
             {
                 StartWatchdog(_publisherProcess);
+                TryAssignPublisherToKillOnCloseJob(_publisherProcess.Id);
+            }
+        }
+
+        // Assigns the activated mspub.exe to a kill-on-close job so a worker
+        // death reaps Publisher. Best-effort: a failure leaves the watchdog +
+        // graceful Quit() as the cleanup path and never blocks initialization.
+        private void TryAssignPublisherToKillOnCloseJob(int publisherPid)
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            try
+            {
+                _mspubJob = WorkerJobObject.CreateKillOnCloseJob();
+                if (_mspubJob == IntPtr.Zero) return;
+                if (!WorkerJobObject.AssignProcessById(_mspubJob, publisherPid))
+                {
+                    WorkerJobObject.CloseJob(_mspubJob);
+                    _mspubJob = IntPtr.Zero;
+                }
+            }
+            catch
+            {
+                _mspubJob = IntPtr.Zero;
             }
         }
 
@@ -106,6 +136,16 @@ namespace PublisherConverter.Core
                 try { Marshal.ReleaseComObject(_pubApp); } catch { }
                 _pubApp = null;
             }
+
+            // Close the kill-on-close job last. Graceful Quit() above normally
+            // exits mspub on its own, leaving the job empty so this is a no-op.
+            // If Quit() failed or hung, closing the job terminates the lingering
+            // mspub.exe — the backstop that guarantees no orphan survives.
+            if (_mspubJob != IntPtr.Zero)
+            {
+                try { WorkerJobObject.CloseJob(_mspubJob); } catch { }
+                _mspubJob = IntPtr.Zero;
+            }
         }
 
         private void StartWatchdog(Process publisherProcess)
@@ -158,12 +198,23 @@ namespace PublisherConverter.Core
             }
         }
 
+        /// <summary>
+        /// Pure PID-diff selection: the first PID in <paramref name="current"/>
+        /// that was not present in <paramref name="preExisting"/> is the
+        /// instance we just activated. Extracted from the Process enumeration so
+        /// the "which PID did we own" decision is unit-testable without Publisher
+        /// (a null result means COM attached to a pre-existing instance).
+        /// </summary>
+        internal static int? SelectOwnedPid(IReadOnlySet<int> preExisting, IReadOnlyCollection<int> current)
+            => current.FirstOrDefault(pid => !preExisting.Contains(pid)) is var p && p != 0 ? p : (int?)null;
+
         private static Process? FindOwnedPublisherProcess(HashSet<int> preExistingPids)
         {
             try
             {
-                return Process.GetProcessesByName(PublisherProcessName)
-                    .FirstOrDefault(p => !preExistingPids.Contains(p.Id));
+                var current = Process.GetProcessesByName(PublisherProcessName);
+                int? ownedPid = SelectOwnedPid(preExistingPids, current.Select(p => p.Id).ToList());
+                return ownedPid.HasValue ? current.FirstOrDefault(p => p.Id == ownedPid.Value) : null;
             }
             catch
             {

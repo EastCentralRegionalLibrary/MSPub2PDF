@@ -132,6 +132,15 @@ namespace PublisherConverter.Core.FontSources
             byte[]? archive = await _http.DownloadBytesAsync(assetUrl, headers, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
             if (archive == null) { Debug(context, $"vendor: asset download failed {assetUrl}"); return FontAcquisitionResult.Miss(request, Layer, "asset download failed"); }
 
+            // Same short-circuit the community resolver applies: a complete-but-tiny
+            // body (empty/error response that still returned 200) can't be an
+            // archive, so treat it as a miss instead of an inspection error.
+            if (archive.Length < FontArchiveInspector.MinArchiveBytes)
+            {
+                Debug(context, $"vendor: empty/short response ({archive.Length} bytes) for {assetUrl} — treating as miss");
+                return FontAcquisitionResult.Miss(request, Layer, "release asset too small to be an archive");
+            }
+
             ArchiveInspection inspection;
             try
             {

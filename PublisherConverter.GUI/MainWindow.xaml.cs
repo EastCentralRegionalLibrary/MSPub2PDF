@@ -17,6 +17,11 @@ namespace PublisherConverter.GUI
         private CancellationTokenSource? _cts;
         private readonly ConverterEngine _engine;
 
+        // Guards the one-time engine disposal that tears down the worker process
+        // (and the mspub.exe it activated) on app exit. Both the normal close
+        // path (OnClosing) and OS logoff/shutdown (SessionEnding) route here.
+        private bool _engineDisposed;
+
         // Tracks absolute source paths attempted during the most recent run
         // (success or failure). Populated from progress reports so a follow-up
         // "Continue" pass can skip them and process the remaining files.
@@ -125,6 +130,30 @@ namespace PublisherConverter.GUI
                 fontResolver,
                 (path, compress) => new ArchiveService(path, compress)
             );
+
+            // OS logoff/shutdown can end the process without a normal window
+            // close, so dispose the engine here too (idempotent with OnClosing).
+            Application.Current.SessionEnding += (s, e) => DisposeEngineOnce();
+        }
+
+        /// <summary>
+        /// Disposes the converter engine exactly once, shutting down the worker
+        /// process and the Publisher (mspub.exe) instance it activated. Safe to
+        /// call from multiple exit paths.
+        /// </summary>
+        private void DisposeEngineOnce()
+        {
+            if (_engineDisposed) return;
+            _engineDisposed = true;
+            try { _engine.Dispose(); } catch { }
+        }
+
+        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+        {
+            // Dispose the engine on window close so no worker / mspub.exe is left
+            // running after the GUI exits.
+            DisposeEngineOnce();
+            base.OnClosing(e);
         }
 
         /// <summary>

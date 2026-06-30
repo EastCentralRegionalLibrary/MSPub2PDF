@@ -32,6 +32,14 @@ namespace PublisherConverter.Core.FontSources
     /// </summary>
     public sealed class FontArchiveInspector
     {
+        /// <summary>
+        /// Smallest possible ZIP: a 22-byte End-Of-Central-Directory record.
+        /// Anything shorter cannot be an archive, so resolvers short-circuit
+        /// such a payload as a miss rather than handing it to ZipArchive. Shared
+        /// by the community and vendor resolvers so the literal lives in one place.
+        /// </summary>
+        public const int MinArchiveBytes = 22;
+
         public async Task<ArchiveInspection> InspectAsync(Stream archiveStream, ArchiveHints? hints, CancellationToken cancellationToken)
         {
             var extract = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -58,10 +66,10 @@ namespace PublisherConverter.Core.FontSources
                 // 22 bytes. Anything shorter — including the 0-byte body a server
                 // returns for a missing resource — is rejected with a clear error
                 // rather than slipping into ZipArchive's "Central Directory" message.
-                if (len < 22)
+                if (len < MinArchiveBytes)
                 {
                     throw new InvalidDataException(
-                        $"Downloaded payload is not a valid ZIP ({len} bytes; minimum is 22). " +
+                        $"Downloaded payload is not a valid ZIP ({len} bytes; minimum is {MinArchiveBytes}). " +
                         "The server likely returned an empty or error response.");
                 }
 
@@ -78,31 +86,55 @@ namespace PublisherConverter.Core.FontSources
                 archiveStream.Position = 0;
             }
 
-            using var zip = new ZipArchive(archiveStream, ZipArchiveMode.Read, leaveOpen: true);
-            foreach (var entry in zip.Entries)
+            // A payload can clear the size + magic guards above and still be an
+            // unreadable ZIP: ≥22 bytes, starts with the local-file-header magic,
+            // but truncated/corrupt at the tail so the central directory is gone.
+            // ZipArchive surfaces that as an InvalidDataException whose native
+            // text mentions "Central Directory" — useless in a log. Normalize it
+            // into a diagnosable message (size + header bytes) so the next
+            // real-world occurrence says which download was corrupt.
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (string.IsNullOrEmpty(entry.Name)) continue; // directory
+                using var zip = new ZipArchive(archiveStream, ZipArchiveMode.Read, leaveOpen: true);
+                foreach (var entry in zip.Entries)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (string.IsNullOrEmpty(entry.Name)) continue; // directory
 
-                string ext = Path.GetExtension(entry.Name).ToLowerInvariant();
-                if (extract.Contains(ext))
-                {
-                    using var ms = new MemoryStream();
-                    using (var es = entry.Open())
+                    string ext = Path.GetExtension(entry.Name).ToLowerInvariant();
+                    if (extract.Contains(ext))
                     {
-                        await es.CopyToAsync(ms, cancellationToken).ConfigureAwait(false);
+                        using var ms = new MemoryStream();
+                        using (var es = entry.Open())
+                        {
+                            await es.CopyToAsync(ms, cancellationToken).ConfigureAwait(false);
+                        }
+                        fonts.Add(new ArchivedFont { EntryName = entry.FullName, Data = ms.ToArray() });
                     }
-                    fonts.Add(new ArchivedFont { EntryName = entry.FullName, Data = ms.ToArray() });
+                    else if (licenseNames.Contains(entry.Name))
+                    {
+                        foundLicenseFiles.Add(entry.FullName);
+                        using var es = entry.Open();
+                        using var reader = new StreamReader(es, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+                        string text = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+                        if (licenseBuilder.Length > 0) licenseBuilder.Append('\n');
+                        licenseBuilder.Append(text);
+                    }
                 }
-                else if (licenseNames.Contains(entry.Name))
+            }
+            catch (InvalidDataException ex)
+            {
+                long len = archiveStream.CanSeek ? archiveStream.Length : -1;
+                string head = "??";
+                if (archiveStream.CanSeek)
                 {
-                    foundLicenseFiles.Add(entry.FullName);
-                    using var es = entry.Open();
-                    using var reader = new StreamReader(es, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-                    string text = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
-                    if (licenseBuilder.Length > 0) licenseBuilder.Append('\n');
-                    licenseBuilder.Append(text);
+                    archiveStream.Position = 0;
+                    var b = new byte[Math.Min(4, (int)archiveStream.Length)];
+                    int n = archiveStream.Read(b, 0, b.Length);
+                    head = BitConverter.ToString(b, 0, n);
                 }
+                throw new InvalidDataException(
+                    $"Archive is not a readable ZIP ({len} bytes, starts {head}): the download is corrupt or truncated.", ex);
             }
 
             return new ArchiveInspection
