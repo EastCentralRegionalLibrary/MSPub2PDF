@@ -20,6 +20,25 @@ namespace PublisherConverter.Core.FontSources
     }
 
     /// <summary>
+    /// A text (GET) response with its status code and response headers preserved,
+    /// so callers can diagnose *why* an API call failed (e.g. GitHub's 403
+    /// rate-limit response) instead of collapsing every failure into null.
+    /// </summary>
+    public sealed class TextFetchResult
+    {
+        public int StatusCode { get; init; }
+
+        /// <summary>Response body; present even on a non-success status when readable.</summary>
+        public string? Body { get; init; }
+
+        /// <summary>Response headers (first value per name, case-insensitive keys).</summary>
+        public IReadOnlyDictionary<string, string> Headers { get; init; }
+            = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        public bool IsSuccess => StatusCode >= 200 && StatusCode < 300;
+    }
+
+    /// <summary>
     /// HTTP surface for the acquisition layers: a fast HEAD/range probe, a bounded
     /// byte download, and a string GET. Every call takes an explicit timeout and a
     /// cancellation token; transient network failures and timeouts return a "miss"
@@ -33,6 +52,13 @@ namespace PublisherConverter.Core.FontSources
         Task<byte[]?> DownloadBytesAsync(string url, IDictionary<string, string>? headers, long maxBytes, TimeSpan timeout, CancellationToken cancellationToken);
 
         Task<string?> GetStringAsync(string url, IDictionary<string, string>? headers, TimeSpan timeout, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Like <see cref="GetStringAsync"/> but preserves the status code and
+        /// response headers, and returns the body even on a non-success status.
+        /// Null only for transport failures/timeouts.
+        /// </summary>
+        Task<TextFetchResult?> GetStringDetailedAsync(string url, IDictionary<string, string>? headers, TimeSpan timeout, CancellationToken cancellationToken);
     }
 
     /// <summary>
@@ -159,6 +185,45 @@ namespace PublisherConverter.Core.FontSources
                 {
                     return null;
                 }
+            }
+        }
+
+        public async Task<TextFetchResult?> GetStringDetailedAsync(string url, IDictionary<string, string>? headers, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var (response, faulted) = await SendAsync(HttpMethod.Get, url, headers, HttpCompletionOption.ResponseContentRead, timeout, cancellationToken).ConfigureAwait(false);
+            if (faulted || response == null) return null;
+            using (response)
+            {
+                string? body = null;
+                try
+                {
+                    body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch
+                {
+                    // Body unreadable — the status/headers are still diagnostic.
+                }
+
+                var responseHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var h in response.Headers)
+                {
+                    foreach (var v in h.Value) { responseHeaders.TryAdd(h.Key, v); break; }
+                }
+                foreach (var h in response.Content.Headers)
+                {
+                    foreach (var v in h.Value) { responseHeaders.TryAdd(h.Key, v); break; }
+                }
+
+                return new TextFetchResult
+                {
+                    StatusCode = (int)response.StatusCode,
+                    Body = body,
+                    Headers = responseHeaders,
+                };
             }
         }
 

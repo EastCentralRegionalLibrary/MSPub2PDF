@@ -26,15 +26,23 @@ namespace PublisherConverter.Core.FontSources
         private readonly FontSourceConfiguration _config;
         private readonly IFontHttpClient _http;
         private readonly FontArchiveInspector _archiveInspector;
+        private readonly Func<string, string?> _environment;
+
+        // Release-asset URLs already resolved this run (keyed by API URL), so
+        // repeated requests for the same vendor don't re-spend the API budget.
+        private readonly object _assetCacheLock = new object();
+        private readonly Dictionary<string, string> _assetUrlCache = new Dictionary<string, string>(StringComparer.Ordinal);
 
         public VendorRepoResolver(
             FontSourceConfiguration config, IFontHttpClient http,
-            FontArchiveInspector archiveInspector, FontLicenseEvaluator license, IStructuredLogger? logger = null)
+            FontArchiveInspector archiveInspector, FontLicenseEvaluator license, IStructuredLogger? logger = null,
+            Func<string, string?>? environment = null)
             : base(license, logger)
         {
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _http = http ?? throw new ArgumentNullException(nameof(http));
             _archiveInspector = archiveInspector ?? throw new ArgumentNullException(nameof(archiveInspector));
+            _environment = environment ?? Environment.GetEnvironmentVariable;
         }
 
         public override ResolutionLayer Layer => ResolutionLayer.VendorRepo;
@@ -55,19 +63,25 @@ namespace PublisherConverter.Core.FontSources
             TimeSpan probeTimeout = TimeSpan.FromMilliseconds(source.TimeoutOverrideMs ?? _config.Policy.ProbeTimeoutMs);
             TimeSpan downloadTimeout = TimeSpan.FromMilliseconds(_config.Policy.DownloadTimeoutMs);
 
+            // Keep the most specific attempt outcome so a diagnosable miss (e.g.
+            // the GitHub rate limit) isn't flattened into a generic reason.
+            FontAcquisitionResult? lastAttempt = null;
+
             if (source.PathTemplates.Count > 0)
             {
                 var raw = await TryRawPathsAsync(source, request, context, probeTimeout, downloadTimeout, cancellationToken).ConfigureAwait(false);
                 if (raw.IsResolved) return raw;
+                lastAttempt = raw;
             }
 
             if (!string.IsNullOrWhiteSpace(source.Repo?.ReleaseAssetPattern))
             {
                 var release = await TryReleaseArchiveAsync(source, request, context, downloadTimeout, cancellationToken).ConfigureAwait(false);
                 if (release.IsResolved) return release;
+                lastAttempt = release;
             }
 
-            return FontAcquisitionResult.Miss(request, Layer, $"no .ttf found at vendor '{source.Id}'");
+            return lastAttempt ?? FontAcquisitionResult.Miss(request, Layer, $"no .ttf found at vendor '{source.Id}'");
         }
 
         private async Task<FontAcquisitionResult> TryRawPathsAsync(
@@ -123,11 +137,43 @@ namespace PublisherConverter.Core.FontSources
                 ["User-Agent"] = "MSPub2PDF/1.0 (+font-acquisition)",
             };
 
-            string? json = await _http.GetStringAsync(apiUrl, headers, TimeSpan.FromMilliseconds(_config.Policy.DownloadTimeoutMs), cancellationToken).ConfigureAwait(false);
-            if (json == null) { Debug(context, $"vendor: release metadata fetch failed for {source.Id}"); return FontAcquisitionResult.Miss(request, Layer, "release metadata unavailable"); }
+            // Optional auth: config first, then GITHUB_TOKEN from the environment.
+            // Absent is the normal, fully supported case (unauthenticated API).
+            string? token = _config.Policy.GitHubToken;
+            if (string.IsNullOrWhiteSpace(token)) token = _environment("GITHUB_TOKEN");
+            var apiHeaders = new Dictionary<string, string>(headers);
+            if (!string.IsNullOrWhiteSpace(token)) apiHeaders["Authorization"] = $"Bearer {token}";
 
-            string? assetUrl = SelectAsset(json, repo.ReleaseAssetPattern!);
-            if (assetUrl == null) { Debug(context, $"vendor: no asset matched '{repo.ReleaseAssetPattern}'"); return FontAcquisitionResult.Miss(request, Layer, "no matching release asset"); }
+            string? assetUrl;
+            lock (_assetCacheLock)
+            {
+                _assetUrlCache.TryGetValue(apiUrl, out assetUrl);
+            }
+
+            if (assetUrl == null)
+            {
+                var response = await _http.GetStringDetailedAsync(apiUrl, apiHeaders, TimeSpan.FromMilliseconds(_config.Policy.DownloadTimeoutMs), cancellationToken).ConfigureAwait(false);
+                if (response == null) { Debug(context, $"vendor: release metadata fetch failed for {source.Id}"); return FontAcquisitionResult.Miss(request, Layer, "release metadata unavailable"); }
+
+                if (IsGitHubRateLimited(response))
+                {
+                    Debug(context, $"vendor: GitHub API rate limit hit for {source.Id} ({apiUrl})");
+                    return FontAcquisitionResult.Miss(request, Layer, RateLimitedReason);
+                }
+                if (!response.IsSuccess || response.Body == null)
+                {
+                    Debug(context, $"vendor: release metadata fetch failed for {source.Id} (HTTP {response.StatusCode})");
+                    return FontAcquisitionResult.Miss(request, Layer, "release metadata unavailable");
+                }
+
+                assetUrl = SelectAsset(response.Body, repo.ReleaseAssetPattern!);
+                if (assetUrl == null) { Debug(context, $"vendor: no asset matched '{repo.ReleaseAssetPattern}'"); return FontAcquisitionResult.Miss(request, Layer, "no matching release asset"); }
+
+                lock (_assetCacheLock)
+                {
+                    _assetUrlCache[apiUrl] = assetUrl;
+                }
+            }
 
             byte[]? archive = await _http.DownloadBytesAsync(assetUrl, headers, MaxArchiveBytes, downloadTimeout, cancellationToken).ConfigureAwait(false);
             if (archive == null) { Debug(context, $"vendor: asset download failed {assetUrl}"); return FontAcquisitionResult.Miss(request, Layer, "asset download failed"); }
@@ -168,6 +214,31 @@ namespace PublisherConverter.Core.FontSources
         }
 
         // ---- helpers (exposed for tests via InternalsVisibleTo) ----
+
+        /// <summary>
+        /// Distinct miss reason for the GitHub API rate limit, so an operator
+        /// hitting it repeatedly knows the remedy rather than seeing a generic
+        /// metadata failure.
+        /// </summary>
+        internal const string RateLimitedReason =
+            "GitHub API rate limit exceeded (unauthenticated limit is 60 requests/hour/IP); " +
+            "set the GITHUB_TOKEN environment variable or policy.gitHubToken to raise it to 5,000/hour";
+
+        /// <summary>
+        /// True only for GitHub's rate-limit response: 403/429 with the
+        /// X-RateLimit-Remaining budget at 0 or the canonical message body.
+        /// Other 403s (private repo, blocked UA, …) keep their own reasons.
+        /// </summary>
+        internal static bool IsGitHubRateLimited(TextFetchResult response)
+        {
+            if (response.StatusCode != 403 && response.StatusCode != 429) return false;
+            if (response.Headers.TryGetValue("X-RateLimit-Remaining", out var remaining) &&
+                remaining.Trim() == "0")
+            {
+                return true;
+            }
+            return response.Body != null && response.Body.Contains("rate limit exceeded", StringComparison.OrdinalIgnoreCase);
+        }
 
         internal static string? SelectAsset(string releaseJson, string pattern)
         {

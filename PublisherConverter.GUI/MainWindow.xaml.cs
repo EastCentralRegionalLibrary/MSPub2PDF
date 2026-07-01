@@ -208,7 +208,9 @@ namespace PublisherConverter.GUI
             var resolvers = new List<IFontSourceResolver>
             {
                 new LocalFontResolver(cache, config, logger),
-                new GoogleFontsResolver(config, http, license, logger),
+                // The disambiguation prompt also serves the Google layer's
+                // variable-font confirmation ("<family> — variable font").
+                new GoogleFontsResolver(config, http, license, logger, disambiguation),
                 new VendorRepoResolver(config, http, archive, license, logger),
                 new CommunityFontResolver(config, http, archive, license, logger, disambiguation),
             };
