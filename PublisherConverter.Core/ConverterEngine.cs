@@ -9,7 +9,7 @@ using PublisherConverter.Core.FontWorker;
 
 namespace PublisherConverter.Core
 {
-    public class ConverterEngine
+    public class ConverterEngine : IDisposable
     {
         private readonly IFileInspector _inspector;
         private readonly IHashProvider _hashProvider;
@@ -18,6 +18,7 @@ namespace PublisherConverter.Core
         private readonly IFontAuditor _fontAuditor;
         private readonly IFontResolver _fontResolver;
         private readonly Func<string, bool, IArchiveService> _archiveServiceFactory;
+        private bool _disposed;
 
         // Latest run's font pre-flight findings, accessible after
         // ExecuteMigrationAsync returns so the GUI (and the automatic
@@ -759,6 +760,25 @@ namespace PublisherConverter.Core
             }
 
             return "\"" + escapedValue.Replace("\"", "\"\"") + "\"";
+        }
+
+        /// <summary>
+        /// Shuts the renderer down so the GUI's exit path tears the worker
+        /// process — and the mspub.exe it activated — down with it. Routes to
+        /// <see cref="IPublisherRenderer.Shutdown"/> (graceful worker teardown)
+        /// and disposes the renderer if it is also <see cref="IDisposable"/>.
+        /// Idempotent: a second call is a no-op.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            try { _renderer.Shutdown(); } catch { }
+            if (_renderer is IDisposable disposableRenderer)
+            {
+                try { disposableRenderer.Dispose(); } catch { }
+            }
         }
 
         private class ProgressReporterWrapper : IProgressReporter

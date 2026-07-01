@@ -24,8 +24,10 @@ namespace PublisherConverter.Core.FontSources
 
         // Smallest possible ZIP is a 22-byte End-Of-Central-Directory record.
         // Anything shorter is an empty/error response (DaFont answers a missing
-        // font with HTTP 200 + a zero-length body), never a real archive.
-        private const int MinArchiveBytes = 22;
+        // font with HTTP 200 + a zero-length body), never a real archive. The
+        // canonical value lives on FontArchiveInspector; alias it here so the
+        // literal isn't duplicated across resolvers.
+        private const int MinArchiveBytes = FontArchiveInspector.MinArchiveBytes;
 
         private const double DefaultMatchThreshold = 0.6;
 

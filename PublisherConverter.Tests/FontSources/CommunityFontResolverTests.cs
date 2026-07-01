@@ -114,6 +114,26 @@ namespace PublisherConverter.Tests.FontSources
             Assert.DoesNotContain(h.Log, l => l.Contains("archive inspection failed"));
         }
 
+        [Fact]
+        public async Task Corrupt_central_directory_is_reported_as_miss_by_community_resolver()
+        {
+            // Server returned a complete-but-corrupt body: a valid ZIP truncated
+            // so its central directory is gone. It clears the size + magic guards
+            // (≥22 bytes, starts 50 4B 03 04) and reaches ZipArchive, which used
+            // to leak "Central Directory" into the resolver's log.
+            var (resolver, http, norm) = Build();
+            byte[] validZip = FontZip("Cool Font", "OFL");
+            byte[] truncated = validZip.Take(40).ToArray();
+            http.SeedFile("https://dl.dafont.com/dl/?f=coolfont", truncated);
+
+            using var h = new ResolverHarness();
+            var result = await resolver.TryResolveAsync(norm.Parse("Cool Font"), h.Context(), CancellationToken.None);
+
+            Assert.Equal(AcquisitionStatus.Missing, result.Status);
+            Assert.DoesNotContain(h.Log, l => l.Contains("Central Directory"));
+            Assert.Contains(h.Log, l => l.Contains("not a readable ZIP"));
+        }
+
         // ---- Issue 4: search disambiguation ----
 
         // Request whose slug (lemoncookiefont) is NOT one of the candidates, so Step A

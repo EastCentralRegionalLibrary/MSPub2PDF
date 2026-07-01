@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -75,7 +76,10 @@ namespace PublisherConverter.Tests
                 launcher,
                 _ => transports.Dequeue(),
                 new FakeWorkerHealthMonitor(),
-                new FakeTimeoutProvider());
+                new FakeTimeoutProvider(),
+                // Short graceful window: the fake worker never exits on its own,
+                // so recycle still kills it — just without a long real-time wait.
+                gracefulExitTimeout: TimeSpan.FromMilliseconds(50));
 
             await client.EnsureWorkerStartedAsync(CancellationToken.None);
             Assert.Single(launcher.CreatedProcesses);
@@ -184,6 +188,79 @@ namespace PublisherConverter.Tests
             await Task.WhenAll(tasks);
 
             Assert.Single(launcher.CreatedProcesses);
+        }
+
+        // -----------------------------
+        // Graceful teardown (Layer 2)
+        // -----------------------------
+
+        [Fact]
+        public async Task Dispose_WorkerExitsGracefully_NotHardKilled()
+        {
+            var launcher = new FakeProcessLauncher();
+            // Transport whose Dispose makes the already-started worker exit on its
+            // own — modelling the pipe close that ends the worker's host loop and
+            // lets it run its renderer's Dispose() (→ mspub Quit()).
+            var transport = new GracefulExitOnDisposeTransport(
+                () => launcher.CreatedProcesses.Count > 0 ? launcher.CreatedProcesses[0] : null);
+
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => transport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider());
+
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+
+            client.Dispose();
+
+            Assert.True(transport.Disposed);
+            Assert.False(launcher.CreatedProcesses[0].Killed); // exited on its own → no hard kill
+        }
+
+        [Fact]
+        public async Task Dispose_WorkerHangs_HardKilledAfterTimeout()
+        {
+            var launcher = new FakeProcessLauncher();
+            var transport = new FakeWorkerTransport(); // default Dispose does not trigger an exit
+
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => transport,
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider(),
+                gracefulExitTimeout: TimeSpan.FromMilliseconds(150));
+
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+
+            var sw = Stopwatch.StartNew();
+            client.Dispose();
+            sw.Stop();
+
+            Assert.True(launcher.CreatedProcesses[0].Killed); // hung → force-killed after the budget
+            // Returned roughly within the timeout, not hung indefinitely (generous CI margin).
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"Dispose took {sw.Elapsed}");
+        }
+
+        [Fact]
+        public async Task Dispose_DisposesTransportBeforeKilling()
+        {
+            var log = new List<string>();
+            var launcher = new OrderRecordingLauncher(log);
+
+            var client = new PublisherWorkerClient(
+                launcher,
+                _ => new OrderRecordingTransport(log),
+                new FakeWorkerHealthMonitor(),
+                new FakeTimeoutProvider(),
+                gracefulExitTimeout: TimeSpan.FromMilliseconds(50));
+
+            await client.EnsureWorkerStartedAsync(CancellationToken.None);
+            client.Dispose();
+
+            Assert.Equal("transport-dispose", log[0]);     // pipe closed first
+            Assert.Contains("kill", log);                  // then force-killed (never exited)
+            Assert.True(log.IndexOf("transport-dispose") < log.IndexOf("kill"));
         }
 
         // -----------------------------
@@ -404,6 +481,64 @@ namespace PublisherConverter.Tests
             {
                 throw new InvalidOperationException("Simulated transport failure");
             }
+        }
+
+        // Disposing this transport drives the (already-started) worker to a
+        // graceful exit, mirroring the pipe-close → host-loop-ends path. The
+        // handle is resolved lazily because it does not exist until the client
+        // starts the worker.
+        private sealed class GracefulExitOnDisposeTransport : IWorkerTransport
+        {
+            private readonly Func<FakeProcessHandle?> _handleAccessor;
+            public bool Disposed { get; private set; }
+
+            public GracefulExitOnDisposeTransport(Func<FakeProcessHandle?> handleAccessor)
+                => _handleAccessor = handleAccessor;
+
+            public void Connect() { }
+            public Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null) => Task.CompletedTask;
+            public Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+            public Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
+                => Task.FromResult(new WorkerResponse { Success = true });
+
+            public void Dispose()
+            {
+                Disposed = true;
+                _handleAccessor()?.SimulateGracefulExit();
+            }
+        }
+
+        // Records teardown order ("transport-dispose" then "kill") into a shared
+        // list so a test can assert the transport is disposed before any kill.
+        private sealed class OrderRecordingTransport : IWorkerTransport
+        {
+            private readonly List<string> _log;
+            public OrderRecordingTransport(List<string> log) => _log = log;
+
+            public void Connect() { }
+            public Task ConnectAsync(CancellationToken cancellationToken, int? timeoutMs = null) => Task.CompletedTask;
+            public Task SendRequestAsync(WorkerRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+            public Task<WorkerResponse> ReceiveResponseAsync(CancellationToken cancellationToken)
+                => Task.FromResult(new WorkerResponse { Success = true });
+            public void Dispose() => _log.Add("transport-dispose");
+        }
+
+        private sealed class OrderRecordingHandle : IProcessHandle
+        {
+            private readonly List<string> _log;
+            public OrderRecordingHandle(List<string> log) => _log = log;
+            public int Id => 1;
+            public bool HasExited { get; private set; }
+            public event EventHandler? Exited;
+            public void Kill() { _log.Add("kill"); HasExited = true; Exited?.Invoke(this, EventArgs.Empty); }
+            public void Dispose() { }
+        }
+
+        private sealed class OrderRecordingLauncher : IProcessLauncher
+        {
+            private readonly List<string> _log;
+            public OrderRecordingLauncher(List<string> log) => _log = log;
+            public IProcessHandle StartWorker(string pipeName) => new OrderRecordingHandle(_log);
         }
 
         private class FakePublisherWorkerClient : IPublisherWorkerClient

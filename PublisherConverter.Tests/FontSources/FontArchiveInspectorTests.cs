@@ -90,6 +90,34 @@ namespace PublisherConverter.Tests.FontSources
         }
 
         [Fact]
+        public async Task Truncated_pk_prefixed_payload_throws_clear_message_not_central_directory()
+        {
+            // A complete-but-corrupt download: a valid ZIP truncated so the
+            // End-Of-Central-Directory record is gone. It still clears both
+            // up-front guards — ≥22 bytes and starting with the local-file-header
+            // magic (50 4B 03 04) — so it reaches ZipArchive, which historically
+            // leaked a "Central Directory" message into the log.
+            byte[] zip = ZipBuilder.Build(new[]
+            {
+                ("MyFont-Regular.ttf", TtfTestBuilder.BuildValidTtf("My Font")),
+            });
+
+            const int truncatedLength = 40;
+            Assert.True(zip.Length > truncatedLength);
+            byte[] truncated = zip.Take(truncatedLength).ToArray();
+            // Sanity: still the ZIP local-file-header magic, still ≥22 bytes.
+            Assert.Equal(new byte[] { 0x50, 0x4B, 0x03, 0x04 }, truncated.Take(4).ToArray());
+
+            using var ms = new MemoryStream(truncated);
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                () => new FontArchiveInspector().InspectAsync(ms, null, CancellationToken.None));
+
+            Assert.Contains("not a readable ZIP", ex.Message);
+            Assert.Contains($"{truncatedLength} bytes", ex.Message); // diagnostic byte count
+            Assert.DoesNotContain("Central Directory", ex.Message);
+        }
+
+        [Fact]
         public async Task Zip_magic_check_passes_for_valid_zip()
         {
             byte[] zip = ZipBuilder.Build(new[]

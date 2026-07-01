@@ -33,12 +33,13 @@ namespace PublisherConverter.Tests
         public int ConsecutiveFailures { get; private set; }
         public int MaxConsecutiveFailures { get; set; } = 3;
         public bool ShutdownCalled { get; private set; }
+        public int ShutdownCount { get; private set; }
         public Queue<Func<FileRecord, Task>> RenderBehaviors { get; } = new Queue<Func<FileRecord, Task>>();
         public List<RenderAttempt> Attempts { get; } = new List<RenderAttempt>();
 
         public void Initialize() { }
         public async Task InitializeAsync(CancellationToken cancellationToken) { await Task.CompletedTask; }
-        public void Shutdown() { ShutdownCalled = true; }
+        public void Shutdown() { ShutdownCalled = true; ShutdownCount++; }
 
         public async Task ExecuteRenderingJobAsync(
             FileRecord record,
@@ -208,6 +209,15 @@ namespace PublisherConverter.Tests
         public void Kill()
         {
             Killed = true;
+            HasExited = true;
+            Exited?.Invoke(this, EventArgs.Empty);
+        }
+
+        // Models the worker exiting on its own (pipe closed → host loop ends).
+        // Unlike Kill, this does NOT set Killed, so tests can distinguish a
+        // graceful exit from a hard kill.
+        public void SimulateGracefulExit()
+        {
             HasExited = true;
             Exited?.Invoke(this, EventArgs.Empty);
         }
