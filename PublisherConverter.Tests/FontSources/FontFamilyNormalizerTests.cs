@@ -83,5 +83,30 @@ namespace PublisherConverter.Tests.FontSources
             Assert.Equal("Roboto", r.NormalizedFamily);
             Assert.Equal("MediumItalic", FontFamilyNormalizer.StyleFileToken(r.RequestedStyles));
         }
+
+        [Fact]
+        public void Splits_run_together_style_without_delimiters()
+        {
+            var r = New().Parse("OpenSansBold");
+            Assert.Equal("OpenSans", r.NormalizedFamily);
+            Assert.Equal(new[] { "Bold" }, r.RequestedStyles);
+        }
+
+        [Fact]
+        public void Decomposes_run_together_compound_styles()
+        {
+            var r = New().Parse("UbuntuExtraBoldItalic");
+            Assert.Equal("Ubuntu", r.NormalizedFamily);
+            Assert.Equal(new[] { "ExtraBold", "Italic" }, r.RequestedStyles);
+        }
+
+        [Fact]
+        public void Applies_alias_to_cleanly_split_run_together_families()
+        {
+            var norm = New(alias: f => f == "SourceSansPro" ? "Source Sans 3" : f);
+            var r = norm.Parse("SourceSansProBold");
+            Assert.Equal("Source Sans 3", r.NormalizedFamily);
+            Assert.Equal(new[] { "Bold" }, r.RequestedStyles);
+        }
     }
 }

@@ -28,6 +28,7 @@ namespace PublisherConverter.Core.FontSources
         };
 
         private readonly HashSet<string> _styleTokens;
+        private readonly List<string> _sortedStyleTokens;
         private readonly Func<string, string> _aliasResolver;
 
         public FontFamilyNormalizer(FontSourceConfiguration config)
@@ -46,6 +47,7 @@ namespace PublisherConverter.Core.FontSources
                     if (key.Length > 0) _styleTokens.Add(key);
                 }
             }
+            _sortedStyleTokens = _styleTokens.OrderByDescending(s => s.Length).ToList();
             _aliasResolver = aliasResolver ?? (x => x);
         }
 
@@ -55,15 +57,24 @@ namespace PublisherConverter.Core.FontSources
             string raw = requestedName ?? string.Empty;
             var tokens = Tokenize(raw);
 
-            // Pop trailing style tokens (decomposing combined ones like "BoldItalic").
+            // Pop trailing style tokens (peeling from right to left).
             var styles = new List<string>();
             int end = tokens.Count;
             while (end > 0)
             {
-                var decomposed = MatchStyle(tokens[end - 1]);
-                if (decomposed == null) break;
+                var peeled = PeelStyles(tokens[end - 1], out string remaining);
+                if (peeled.Count == 0) break;
+
                 // Keep document order: prepend this token's styles ahead of later ones.
-                styles.InsertRange(0, decomposed);
+                styles.InsertRange(0, peeled);
+
+                if (remaining.Length > 0)
+                {
+                    // We found styles but the token still has content; this must be the family name.
+                    tokens[end - 1] = remaining;
+                    break;
+                }
+
                 end--;
             }
 
@@ -147,26 +158,70 @@ namespace PublisherConverter.Core.FontSources
             return tokens;
         }
 
-        // Returns the canonical style names a token represents, or null if it is
-        // not a style token at all.
-        private List<string>? MatchStyle(string token)
+        private List<string> PeelStyles(string token, out string remaining)
         {
-            string key = Canon(token);
-            if (key.Length == 0) return null;
+            var peeled = new List<string>();
+            string current = token;
 
-            if (_styleTokens.Contains(key)) return new List<string> { CanonName(key) };
-
-            // Try to split a combined token (e.g. "bolditalic", "boldoblique").
-            for (int i = 2; i < key.Length - 1; i++)
+            while (true)
             {
-                string left = key.Substring(0, i);
-                string right = key.Substring(i);
-                if (_styleTokens.Contains(left) && _styleTokens.Contains(right))
+                current = TrimTrailingSeparators(current);
+                if (current.Length == 0) break;
+
+                string key = Canon(current);
+                bool matched = false;
+
+                foreach (var styleKey in _sortedStyleTokens)
                 {
-                    return new List<string> { CanonName(left), CanonName(right) };
+                    if (key.EndsWith(styleKey, StringComparison.Ordinal))
+                    {
+                        int styleStartIdx = FindStyleStartIndex(current, styleKey);
+                        if (styleStartIdx >= 0)
+                        {
+                            peeled.Insert(0, CanonName(styleKey));
+                            current = current.Substring(0, styleStartIdx);
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!matched) break;
+            }
+
+            remaining = current;
+            return peeled;
+        }
+
+        private static string TrimTrailingSeparators(string s)
+        {
+            int i = s.Length - 1;
+            while (i >= 0 && (char.IsWhiteSpace(s[i]) || s[i] == '-' || s[i] == '_'))
+            {
+                i--;
+            }
+            return s.Substring(0, i + 1);
+        }
+
+        private static int FindStyleStartIndex(string token, string styleKey)
+        {
+            int styleCharIdx = styleKey.Length - 1;
+            for (int i = token.Length - 1; i >= 0; i--)
+            {
+                char c = token[i];
+                if (!char.IsLetterOrDigit(c)) continue;
+
+                if (char.ToLowerInvariant(c) == styleKey[styleCharIdx])
+                {
+                    styleCharIdx--;
+                    if (styleCharIdx < 0) return i;
+                }
+                else
+                {
+                    return -1;
                 }
             }
-            return null;
+            return -1;
         }
 
         private static List<string> CanonicalStyles(List<string> styles)
