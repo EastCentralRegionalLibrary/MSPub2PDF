@@ -72,11 +72,17 @@
       "priority": 30,
       "routingPatterns": [ "ibm", "plex" ],
       "rawBaseUrl": "https://raw.githubusercontent.com",
+      // IBM/plex reorganized into a monorepo: fonts moved from IBM-Plex-<Family>/
+      // to packages/plex-<family>/. Verified 2026-07 against the live raw CDN
+      // (packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Regular.ttf → 200;
+      // the old IBM-Plex-Sans/… layout and branch "main" both 404). Raw-path
+      // repos can drift like this silently — when a vendorRepo source starts
+      // missing, re-check its path templates against the live repo first.
       "repo": { "owner": "IBM", "repo": "plex", "branch": "master" },
       "pathTemplates": [
-        "IBM-Plex-Sans/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf",
-        "IBM-Plex-Serif/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf",
-        "IBM-Plex-Mono/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf"
+        "packages/plex-sans/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf",
+        "packages/plex-serif/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf",
+        "packages/plex-mono/fonts/complete/ttf/{FamilyNoSpace}-{Style}.ttf"
       ],
       "styles": [ "Regular", "Bold", "Italic", "BoldItalic" ],
       "supportedExtensions": [ ".ttf" ],

@@ -120,15 +120,27 @@ namespace PublisherConverter.Tests.FontSources
     {
         public Dictionary<string, byte[]> Files { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, string> Pages { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, TextFetchResult> DetailedResponses { get; } = new(StringComparer.Ordinal);
         public HashSet<string> Existing { get; } = new(StringComparer.Ordinal);
 
         public List<string> Probed { get; } = new();
         public List<string> Downloaded { get; } = new();
         public List<string> Fetched { get; } = new();
 
+        /// <summary>Request headers observed per GET/detailed-GET, in call order.</summary>
+        public List<(string Url, IDictionary<string, string>? Headers)> FetchedRequests { get; } = new();
+
         public void SeedFile(string url, byte[] data) { Files[url] = data; Existing.Add(url); }
         public void SeedExists(string url) => Existing.Add(url);
         public void SeedPage(string url, string body) => Pages[url] = body;
+
+        public void SeedResponse(string url, int statusCode, string? body = null, IDictionary<string, string>? headers = null)
+            => DetailedResponses[url] = new TextFetchResult
+            {
+                StatusCode = statusCode,
+                Body = body,
+                Headers = new Dictionary<string, string>(headers ?? new Dictionary<string, string>(), StringComparer.OrdinalIgnoreCase),
+            };
 
         public Task<ProbeResult> ProbeAsync(string url, IDictionary<string, string>? headers, TimeSpan timeout, CancellationToken cancellationToken)
         {
@@ -147,7 +159,17 @@ namespace PublisherConverter.Tests.FontSources
         public Task<string?> GetStringAsync(string url, IDictionary<string, string>? headers, TimeSpan timeout, CancellationToken cancellationToken)
         {
             Fetched.Add(url);
+            FetchedRequests.Add((url, headers));
             return Task.FromResult(Pages.TryGetValue(url, out var s) ? s : null);
+        }
+
+        public Task<TextFetchResult?> GetStringDetailedAsync(string url, IDictionary<string, string>? headers, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            Fetched.Add(url);
+            FetchedRequests.Add((url, headers));
+            if (DetailedResponses.TryGetValue(url, out var seeded)) return Task.FromResult<TextFetchResult?>(seeded);
+            if (Pages.TryGetValue(url, out var s)) return Task.FromResult<TextFetchResult?>(new TextFetchResult { StatusCode = 200, Body = s });
+            return Task.FromResult<TextFetchResult?>(null);
         }
     }
 

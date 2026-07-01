@@ -100,6 +100,16 @@ namespace PublisherConverter.Core.FontSources
         public int ProbeTimeoutMs { get; set; } = 3000;
         public int DownloadTimeoutMs { get; set; } = 60000;
 
+        /// <summary>
+        /// Optional GitHub API token used as a bearer Authorization header on
+        /// api.github.com calls (release-archive sources). Raises the
+        /// unauthenticated 60 req/hour/IP rate limit to 5,000/hour. Never
+        /// required — when absent the resolver also checks the GITHUB_TOKEN
+        /// environment variable, and proceeds unauthenticated if neither is set.
+        /// Never ship a default value here.
+        /// </summary>
+        public string? GitHubToken { get; set; }
+
         public LicensePolicyOptions License { get; set; } = new LicensePolicyOptions();
     }
 
@@ -122,6 +132,13 @@ namespace PublisherConverter.Core.FontSources
 
         /// <summary>License sub-directories to probe (Google Fonts: ofl/apache/ufl).</summary>
         public List<string> LicenseDirs { get; set; } = new List<string>();
+
+        /// <summary>
+        /// Path template of the per-family metadata file that authoritatively
+        /// lists the family's font files (google/fonts METADATA.pb). Used when no
+        /// static file matches the path templates, e.g. variable-only families.
+        /// </summary>
+        public string MetadataPathTemplate { get; set; } = "{licenseDir}/{slug}/METADATA.pb";
 
         /// <summary>Vendor routing patterns (regex) matched against the requested family.</summary>
         public List<string> RoutingPatterns { get; set; } = new List<string>();

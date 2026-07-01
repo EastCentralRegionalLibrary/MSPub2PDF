@@ -25,6 +25,16 @@
     <None Include="TestData\TestFile.pub">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="TestData\FontSources\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!--
+      The shipped source registry, linked in so the RequiresNetwork tests
+      exercise the exact configuration the GUI deploys.
+    -->
+    <None Include="..\PublisherConverter.GUI\FontSources.json" Link="TestData\FontSources\FontSources.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <ItemGroup>
