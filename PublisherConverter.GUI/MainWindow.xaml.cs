@@ -40,10 +40,21 @@ namespace PublisherConverter.GUI
             var manifestWriter = new ManifestWriter();
             var renderer = new PublisherLifecycleManager();
 
+            // FontSources.json is loaded once, up front, because its
+            // styleSuffixes feed the style-aware normalizer shared by BOTH
+            // sides: detection (installed-font matching below) and acquisition
+            // (the resolver chain). One source of truth for what a style token
+            // is. Detection deliberately gets the style list only — aliases
+            // stay an acquisition concern.
+            FontSourceConfiguration? fontSourcesConfig = TryLoadFontSourcesConfiguration();
+            var detectionNormalizer = fontSourcesConfig != null
+                ? new FontFamilyNormalizer(fontSourcesConfig.StyleSuffixes)
+                : new FontFamilyNormalizer();
+
             // Shared cache so the auditor and the resolver agree on
             // installed-font state. The resolver mutates the cache after
             // successful provisioning; the next per-file audit picks it up.
-            var fontCache = new FontAvailabilityCache(new WindowsRegistryFontProvider());
+            var fontCache = new FontAvailabilityCache(new WindowsRegistryFontProvider(detectionNormalizer));
             var fontAuditor = new FontAuditor(new PublisherFontExtractor(), fontCache);
 
             // Mapping ships next to the GUI binary; missing/malformed file
@@ -119,7 +130,7 @@ namespace PublisherConverter.GUI
             // chain (Google Fonts → vendor repos → community), all .ttf-only and
             // license-gated. A bad/missing FontSources.json degrades gracefully to
             // Microsoft-only rather than taking down startup.
-            IFontResolver fontResolver = BuildFontResolver(fontService, fontCache, downloader, fontLogger);
+            IFontResolver fontResolver = BuildFontResolver(fontService, fontCache, downloader, fontLogger, fontSourcesConfig);
 
             _engine = new ConverterEngine(
                 inspector,
@@ -157,22 +168,18 @@ namespace PublisherConverter.GUI
         }
 
         /// <summary>
-        /// Builds the layered font acquisition chain from FontSources.json,
-        /// wrapping the Microsoft-owned layer. If the registry is missing or
-        /// malformed the failure is surfaced and the app falls back to
-        /// Microsoft-only acquisition so a config error never blocks startup.
+        /// Loads FontSources.json from beside the binary. On a missing or
+        /// malformed registry the failure is surfaced once and null is returned
+        /// so the app falls back to Microsoft-only acquisition (and the
+        /// default style-token set for detection) — a config error never
+        /// blocks startup.
         /// </summary>
-        private IFontResolver BuildFontResolver(
-            IFontResolver microsoftLayer,
-            FontAvailabilityCache cache,
-            HttpFontDownloader downloader,
-            IStructuredLogger logger)
+        private static FontSourceConfiguration? TryLoadFontSourcesConfiguration()
         {
             string sourcesPath = Path.Combine(AppContext.BaseDirectory, "FontSources.json");
-            FontSourceConfiguration config;
             try
             {
-                config = FontSourceConfiguration.LoadFromFile(sourcesPath);
+                return FontSourceConfiguration.LoadFromFile(sourcesPath);
             }
             catch (FontSourceConfigurationException ex)
             {
@@ -181,8 +188,24 @@ namespace PublisherConverter.GUI
                     "Font sources configuration",
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
-                return microsoftLayer;
+                return null;
             }
+        }
+
+        /// <summary>
+        /// Builds the layered font acquisition chain from the loaded
+        /// FontSources.json configuration, wrapping the Microsoft-owned layer.
+        /// A null configuration (load failed at startup) falls back to
+        /// Microsoft-only acquisition.
+        /// </summary>
+        private IFontResolver BuildFontResolver(
+            IFontResolver microsoftLayer,
+            FontAvailabilityCache cache,
+            HttpFontDownloader downloader,
+            IStructuredLogger logger,
+            FontSourceConfiguration? config)
+        {
+            if (config == null) return microsoftLayer;
 
             var http = new HttpFontClient();
             var license = new FontLicenseEvaluator(config.Policy.License);

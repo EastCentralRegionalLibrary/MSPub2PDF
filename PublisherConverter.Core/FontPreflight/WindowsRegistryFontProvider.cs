@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.Versioning;
 using Microsoft.Win32;
+using PublisherConverter.Core.FontSources;
 
 namespace PublisherConverter.Core
 {
@@ -9,29 +10,43 @@ namespace PublisherConverter.Core
     /// Reads the installed-font list from the standard Windows font registry
     /// keys (machine-scope and current-user). Each value name looks like
     /// "Family (TrueType)" or "Family A &amp; Family B (TrueType)"; we strip the
-    /// parenthesised suffix and split on ampersand so each family lands in the
-    /// lookup table on its own.
+    /// parenthesised suffix and split on ampersand so each face lands in the
+    /// lookup on its own.
+    ///
+    /// Matching is delegated to the platform-neutral
+    /// <see cref="InstalledFontIndex"/>: an exact full-name check first, then a
+    /// style-gated family fallback so multi-face families that register only
+    /// per-face ("Lucida Sans Regular"/"… Demibold" with no bare "Lucida Sans"
+    /// entry) still satisfy a bare-family request, while styled requests never
+    /// over-match. See the index's doc comment for the full decision.
     ///
     /// Built once and used many times: enumeration happens in the constructor
-    /// and IsInstalled is a HashSet hit, so the orchestrator can call it for
-    /// every font in every document without paying registry I/O each time.
+    /// and IsInstalled is a couple of HashSet hits, so the orchestrator can call
+    /// it for every font in every document without paying registry I/O each time.
     /// </summary>
     [SupportedOSPlatform("windows")]
     public sealed class WindowsRegistryFontProvider : IRefreshableInstalledFontProvider
     {
         private const string FontsSubKey = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
 
-        private volatile HashSet<string> _installed;
+        private readonly FontFamilyNormalizer _normalizer;
+        private volatile InstalledFontIndex _index;
 
-        public WindowsRegistryFontProvider()
+        /// <param name="normalizer">
+        /// Style-aware normalizer shared with the acquisition side so detection
+        /// and acquisition agree on what a style token is. Defaults to the
+        /// built-in style-token set when no configured instance is supplied.
+        /// </param>
+        public WindowsRegistryFontProvider(FontFamilyNormalizer? normalizer = null)
         {
-            _installed = BuildIndex();
+            _normalizer = normalizer ?? new FontFamilyNormalizer();
+            _index = BuildIndex(_normalizer);
         }
 
         public bool IsInstalled(string family)
         {
             if (string.IsNullOrEmpty(family)) return false;
-            return _installed.Contains(FontNameNormalizer.Normalize(family));
+            return _index.IsInstalled(family);
         }
 
         /// <summary>
@@ -41,20 +56,20 @@ namespace PublisherConverter.Core
         /// </summary>
         public void Refresh()
         {
-            _installed = BuildIndex();
+            _index = BuildIndex(_normalizer);
         }
 
-        public IReadOnlyCollection<string> NormalizedFontNames => _installed;
+        public IReadOnlyCollection<string> NormalizedFontNames => _index.NormalizedFontNames;
 
-        private static HashSet<string> BuildIndex()
+        private static InstalledFontIndex BuildIndex(FontFamilyNormalizer normalizer)
         {
-            var set = new HashSet<string>(StringComparer.Ordinal);
-            EnumerateRegistry(Registry.LocalMachine, set);
-            EnumerateRegistry(Registry.CurrentUser, set);
-            return set;
+            var faces = new List<string>();
+            EnumerateRegistry(Registry.LocalMachine, faces);
+            EnumerateRegistry(Registry.CurrentUser, faces);
+            return new InstalledFontIndex(faces, normalizer);
         }
 
-        private static void EnumerateRegistry(RegistryKey root, HashSet<string> sink)
+        private static void EnumerateRegistry(RegistryKey root, List<string> sink)
         {
             try
             {
@@ -64,9 +79,9 @@ namespace PublisherConverter.Core
                 foreach (var valueName in key.GetValueNames())
                 {
                     if (string.IsNullOrEmpty(valueName)) continue;
-                    foreach (var family in ExtractFamilyNames(valueName))
+                    foreach (var face in ExtractFamilyNames(valueName))
                     {
-                        sink.Add(FontNameNormalizer.Normalize(family));
+                        sink.Add(face);
                     }
                 }
             }
