@@ -108,5 +108,79 @@ namespace PublisherConverter.Tests.FontSources
             Assert.Equal("Source Sans 3", r.NormalizedFamily);
             Assert.Equal(new[] { "Bold" }, r.RequestedStyles);
         }
+
+        // ---- compound multi-word weights ("Extra Bold" → ExtraBold) ----
+
+        [Theory]
+        [InlineData("Montserrat Extra Bold", "Montserrat", "ExtraBold")]
+        [InlineData("Montserrat Semi Bold", "Montserrat", "SemiBold")]
+        [InlineData("Open Sans Extra Bold", "Open Sans", "ExtraBold")]
+        [InlineData("Consolas Extra Bold", "Consolas", "ExtraBold")]
+        [InlineData("Montserrat Extra Light", "Montserrat", "ExtraLight")]
+        public void Joins_multi_word_weight_into_canonical_style(string requested, string family, string style)
+        {
+            var r = New().Parse(requested);
+            Assert.Equal(family, r.NormalizedFamily);
+            Assert.Equal(new[] { style }, r.RequestedStyles);
+        }
+
+        [Fact]
+        public void Joins_multi_word_weight_followed_by_italic()
+        {
+            var r = New().Parse("Montserrat Extra Bold Italic");
+            Assert.Equal("Montserrat", r.NormalizedFamily);
+            Assert.Equal(new[] { "ExtraBold", "Italic" }, r.RequestedStyles);
+            Assert.Equal("ExtraBoldItalic", FontFamilyNormalizer.StyleFileToken(r.RequestedStyles));
+        }
+
+        [Fact]
+        public void Multi_word_weights_parse_with_the_shipped_style_suffix_config()
+        {
+            // The exact production repro: the real FontSources.json style list.
+            var config = FontSourceConfiguration.LoadFromFile(
+                System.IO.Path.Combine(System.AppContext.BaseDirectory, "TestData", "FontSources", "FontSources.json"));
+            var r = new FontFamilyNormalizer(config).Parse("Montserrat Extra Bold");
+
+            Assert.Equal("Montserrat", r.NormalizedFamily);
+            Assert.Equal(new[] { "ExtraBold" }, r.RequestedStyles);
+        }
+
+        [Theory]
+        [InlineData("Montserrat ExtraBold", "Montserrat", "ExtraBold")] // concatenated form unchanged
+        [InlineData("Arial Bold", "Arial", "Bold")]
+        public void Single_token_weights_are_unchanged(string requested, string family, string style)
+        {
+            var r = New().Parse(requested);
+            Assert.Equal(family, r.NormalizedFamily);
+            Assert.Equal(new[] { style }, r.RequestedStyles);
+        }
+
+        [Theory]
+        [InlineData("Times New Roman")]
+        [InlineData("Franklin Gothic Book")] // "Book" is deliberately not a weight token
+        [InlineData("Lucida Sans")]
+        public void Family_words_are_never_consumed_as_modifiers(string requested)
+        {
+            var r = New().Parse(requested);
+            Assert.Equal(requested, r.NormalizedFamily);
+            Assert.Empty(r.RequestedStyles);
+        }
+
+        [Fact]
+        public void Font_literally_named_extra_bold_keeps_its_family()
+        {
+            var r = New().Parse("Extra Bold");
+            Assert.Equal("Extra Bold", r.NormalizedFamily);
+            Assert.Empty(r.RequestedStyles);
+        }
+
+        [Fact]
+        public void Modifier_without_base_weight_stays_in_the_family()
+        {
+            // "Extra" not followed (rightward) by a base weight is family text.
+            var r = New().Parse("Extra Swift Italic");
+            Assert.Equal("Extra Swift", r.NormalizedFamily);
+            Assert.Equal(new[] { "Italic" }, r.RequestedStyles);
+        }
     }
 }

@@ -27,6 +27,22 @@ namespace PublisherConverter.Core.FontSources
             "black", "heavy", "extrabold", "ultrabold", "extralight", "ultralight",
         };
 
+        // Weight modifier words that are only meaningful joined to an adjacent
+        // base weight: "Extra Bold" → ExtraBold, "Semi Bold" → SemiBold, … A
+        // modifier is joined ONLY when the concatenated form is already a known
+        // style token, so real family words are never consumed ("Times New
+        // Roman", "Franklin Gothic Book" are untouched) and the set stays in
+        // sync with the configured style-suffix list rather than per-font logic.
+        private static readonly HashSet<string> WeightModifierTokens = new(StringComparer.Ordinal)
+        {
+            "extra", "semi", "demi", "ultra",
+        };
+
+        private static readonly HashSet<string> BaseWeightTokens = new(StringComparer.Ordinal)
+        {
+            "bold", "light", "black",
+        };
+
         private readonly HashSet<string> _styleTokens;
         private readonly List<string> _sortedStyleTokens;
         private readonly Func<string, string> _aliasResolver;
@@ -63,7 +79,20 @@ namespace PublisherConverter.Core.FontSources
             while (end > 0)
             {
                 var peeled = PeelStyles(tokens[end - 1], out string remaining);
-                if (peeled.Count == 0) break;
+                if (peeled.Count == 0)
+                {
+                    // A lone modifier word directly before a just-peeled base
+                    // weight is a two-word compound weight ("Extra Bold" →
+                    // ExtraBold, "Semi Bold" → SemiBold): consume it and
+                    // upgrade the peeled style to the joined canonical form.
+                    if (styles.Count > 0 && TryJoinWeightModifier(tokens[end - 1], styles[0], out string joined))
+                    {
+                        styles[0] = joined;
+                        end--;
+                        continue;
+                    }
+                    break;
+                }
 
                 // Keep document order: prepend this token's styles ahead of later ones.
                 styles.InsertRange(0, peeled);
@@ -156,6 +185,27 @@ namespace PublisherConverter.Core.FontSources
             }
             if (sb.Length > 0) tokens.Add(sb.ToString());
             return tokens;
+        }
+
+        // Joins "Extra"/"Semi"/"Demi"/"Ultra" with the base weight peeled
+        // immediately to its right ("bold"/"light"/"black") when — and only
+        // when — the concatenation is a known style token, yielding that
+        // token's canonical name. Anything else (including already-compound
+        // styles like ExtraBold) is left alone.
+        private bool TryJoinWeightModifier(string token, string peeledStyle, out string joined)
+        {
+            joined = string.Empty;
+            string modifier = Canon(token);
+            if (!WeightModifierTokens.Contains(modifier)) return false;
+
+            string baseWeight = Canon(peeledStyle);
+            if (!BaseWeightTokens.Contains(baseWeight)) return false;
+
+            string combined = modifier + baseWeight;
+            if (!_styleTokens.Contains(combined)) return false;
+
+            joined = CanonName(combined);
+            return true;
         }
 
         private List<string> PeelStyles(string token, out string remaining)
